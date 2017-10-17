@@ -56,12 +56,16 @@ impl Operations {
 		Ok(({ let r = result.pop().ok_or("Invalid return arity")?; let r = r.to_bool().ok_or("Invalid type returned")?; r }))
 		*/
 
+		use std::str::FromStr;
+
+		let _release_u256 : bigint::prelude::U256 = _release.into();
+
 		let call = self.derived_contract
 			.functions()
 			.is_latest()
 			.call(
-				_client.as_bytes(), //_client.as_bytes().to_owned(),
-				[0u8;32], // _release.as_ref().to_owned(),
+				bigint::prelude::U256::from_str(_client).unwrap(),
+				_release_u256,
 				|input| (self.do_call)(self.address.clone(), input).map_err(|s| s.into()) // <-- something is fishy here
 			);
 		call.map_err(|e| format!("{:?}", e))
