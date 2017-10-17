@@ -399,12 +399,12 @@ impl Service for Updater {
 mod tests {
 	// use super::operations::Operations ?
 
-	use_contract!(operations,"Operations","./res/operations.abi");
+	// use_contract!(operations,"Operations","./res/operations.abi");
 
 	#[test]
 	fn test_derive_call() {
 		use operations::Operations;
-		let address : ::util::Address = 0x14df6d3c2b83da5acb93ace.into();
+		let address : ::util::Address = 0x111114df6d3c2b833ace.into();
 		let closure = move |address, data| Err("Mock mock mock".to_owned());
 		let ops = Operations::new(address, closure);
 		let bh : ::bigint::hash::H256 = 3u64.into();

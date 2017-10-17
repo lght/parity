@@ -7,8 +7,15 @@ use ethabi;
 use util;
 use bigint;
 
+use_contract!(operations_contract,"Operations","./res/operations.abi");
+
+// mod operations_contract {
+// 	include!("derived_contract.rs");
+// }
+
 pub struct Operations {
 	contract: ethabi::Contract,
+	derived_contract: operations_contract::Operations,
 	address: util::Address,
 	do_call: Box<Fn(util::Address, Vec<u8>) -> Result<Vec<u8>, String> + Send + Sync + 'static>,
 }
@@ -16,6 +23,7 @@ impl Operations {
 	pub fn new<F>(address: util::Address, do_call: F) -> Self where F: Fn(util::Address, Vec<u8>) -> Result<Vec<u8>, String> + Send + Sync + 'static {
 		Operations {
 			contract: ethabi::Contract::load(b"[{\"constant\":false,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_newOwner\",\"type\":\"address\"}],\"name\":\"resetClientOwner\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_release\",\"type\":\"bytes32\"}],\"name\":\"isLatest\",\"outputs\":[{\"name\":\"\",\"type\":\"bool\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_txid\",\"type\":\"bytes32\"}],\"name\":\"rejectTransaction\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_newOwner\",\"type\":\"address\"}],\"name\":\"setOwner\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_number\",\"type\":\"uint32\"},{\"name\":\"_name\",\"type\":\"bytes32\"},{\"name\":\"_hard\",\"type\":\"bool\"},{\"name\":\"_spec\",\"type\":\"bytes32\"}],\"name\":\"proposeFork\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"}],\"name\":\"removeClient\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_release\",\"type\":\"bytes32\"}],\"name\":\"release\",\"outputs\":[{\"name\":\"o_forkBlock\",\"type\":\"uint32\"},{\"name\":\"o_track\",\"type\":\"uint8\"},{\"name\":\"o_semver\",\"type\":\"uint24\"},{\"name\":\"o_critical\",\"type\":\"bool\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_checksum\",\"type\":\"bytes32\"}],\"name\":\"build\",\"outputs\":[{\"name\":\"o_release\",\"type\":\"bytes32\"},{\"name\":\"o_platform\",\"type\":\"bytes32\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[],\"name\":\"rejectFork\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"\",\"type\":\"bytes32\"}],\"name\":\"client\",\"outputs\":[{\"name\":\"owner\",\"type\":\"address\"},{\"name\":\"required\",\"type\":\"bool\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_newOwner\",\"type\":\"address\"}],\"name\":\"setClientOwner\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"\",\"type\":\"uint32\"}],\"name\":\"fork\",\"outputs\":[{\"name\":\"name\",\"type\":\"bytes32\"},{\"name\":\"spec\",\"type\":\"bytes32\"},{\"name\":\"hard\",\"type\":\"bool\"},{\"name\":\"ratified\",\"type\":\"bool\"},{\"name\":\"requiredCount\",\"type\":\"uint256\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_release\",\"type\":\"bytes32\"},{\"name\":\"_platform\",\"type\":\"bytes32\"},{\"name\":\"_checksum\",\"type\":\"bytes32\"}],\"name\":\"addChecksum\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_txid\",\"type\":\"bytes32\"}],\"name\":\"confirmTransaction\",\"outputs\":[{\"name\":\"txSuccess\",\"type\":\"uint256\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"\",\"type\":\"bytes32\"}],\"name\":\"proxy\",\"outputs\":[{\"name\":\"requiredCount\",\"type\":\"uint256\"},{\"name\":\"to\",\"type\":\"address\"},{\"name\":\"data\",\"type\":\"bytes\"},{\"name\":\"value\",\"type\":\"uint256\"},{\"name\":\"gas\",\"type\":\"uint256\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_owner\",\"type\":\"address\"}],\"name\":\"addClient\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"\",\"type\":\"address\"}],\"name\":\"clientOwner\",\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_txid\",\"type\":\"bytes32\"},{\"name\":\"_to\",\"type\":\"address\"},{\"name\":\"_data\",\"type\":\"bytes\"},{\"name\":\"_value\",\"type\":\"uint256\"},{\"name\":\"_gas\",\"type\":\"uint256\"}],\"name\":\"proposeTransaction\",\"outputs\":[{\"name\":\"txSuccess\",\"type\":\"uint256\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[],\"name\":\"grandOwner\",\"outputs\":[{\"name\":\"\",\"type\":\"address\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_release\",\"type\":\"bytes32\"},{\"name\":\"_forkBlock\",\"type\":\"uint32\"},{\"name\":\"_track\",\"type\":\"uint8\"},{\"name\":\"_semver\",\"type\":\"uint24\"},{\"name\":\"_critical\",\"type\":\"bool\"}],\"name\":\"addRelease\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[],\"name\":\"acceptFork\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[],\"name\":\"clientsRequired\",\"outputs\":[{\"name\":\"\",\"type\":\"uint32\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_release\",\"type\":\"bytes32\"}],\"name\":\"track\",\"outputs\":[{\"name\":\"\",\"type\":\"uint8\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":false,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_r\",\"type\":\"bool\"}],\"name\":\"setClientRequired\",\"outputs\":[],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[],\"name\":\"latestFork\",\"outputs\":[{\"name\":\"\",\"type\":\"uint32\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_track\",\"type\":\"uint8\"}],\"name\":\"latestInTrack\",\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[{\"name\":\"_client\",\"type\":\"bytes32\"},{\"name\":\"_release\",\"type\":\"bytes32\"},{\"name\":\"_platform\",\"type\":\"bytes32\"}],\"name\":\"checksum\",\"outputs\":[{\"name\":\"\",\"type\":\"bytes32\"}],\"payable\":false,\"type\":\"function\"},{\"constant\":true,\"inputs\":[],\"name\":\"proposedFork\",\"outputs\":[{\"name\":\"\",\"type\":\"uint32\"}],\"payable\":false,\"type\":\"function\"}]" as &[u8]).expect("JSON is autogenerated; qed"),
+			derived_contract: operations_contract::Operations::default(),
 			address: address,
 			do_call: Box::new(do_call),
 		}
@@ -37,6 +45,8 @@ impl Operations {
 	/// Auto-generated from: `{"constant":true,"inputs":[{"name":"_client","type":"bytes32"},{"name":"_release","type":"bytes32"}],"name":"isLatest","outputs":[{"name":"","type":"bool"}],"payable":false,"type":"function"}`
 	#[allow(dead_code)]
 	pub fn is_latest(&self, _client: &str, _release: &bigint::hash::H256) -> Result<bool, String> {
+		/*
+		old version:
 		let call = self.contract.function("isLatest".into()).map_err(Self::as_string)?;
 		let data = call.encode_input(&
 			vec![ethabi::Token::FixedBytes(_client.as_bytes().to_owned()), ethabi::Token::FixedBytes(_release.as_ref().to_owned())]
@@ -44,6 +54,20 @@ impl Operations {
 		let output = call.decode_output(&(self.do_call)(self.address.clone(), data)?).map_err(Self::as_string)?;
 		let mut result = output.into_iter().rev().collect::<Vec<_>>();
 		Ok(({ let r = result.pop().ok_or("Invalid return arity")?; let r = r.to_bool().ok_or("Invalid type returned")?; r }))
+		*/
+
+		let call = self.derived_contract
+			.functions()
+			.is_latest()
+			.call(
+				[0u8;32], //_client.as_bytes().to_owned(),
+				[0u8;32], // _release.as_ref().to_owned(),
+				|input| (self.do_call)(self.address.clone(), input).map_err(|s| s.into()) // <-- something is fishy here
+			);
+		call.map_err(|e| format!("{:?}", e))
+
+		// let mut result = output.into_iter().rev().collect::<Vec<_>>();
+		// Ok(({ let r = result.pop().ok_or("Invalid return arity")?; let r = r.to_bool().ok_or("Invalid type returned")?; r }))
 	}
 
 	/// Auto-generated from: `{"constant":false,"inputs":[{"name":"_txid","type":"bytes32"}],"name":"rejectTransaction","outputs":[],"payable":false,"type":"function"}`
