@@ -60,7 +60,7 @@ impl Operations {
 			.functions()
 			.is_latest()
 			.call(
-				[0u8;32], //_client.as_bytes().to_owned(),
+				_client.as_bytes(), //_client.as_bytes().to_owned(),
 				[0u8;32], // _release.as_ref().to_owned(),
 				|input| (self.do_call)(self.address.clone(), input).map_err(|s| s.into()) // <-- something is fishy here
 			);
