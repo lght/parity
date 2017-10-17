@@ -24,12 +24,15 @@ extern crate parking_lot;
 extern crate parity_hash_fetch as hash_fetch;
 extern crate ethcore;
 extern crate ethabi;
+#[macro_use] extern crate ethabi_derive;
+#[macro_use] extern crate ethabi_contract;
 extern crate ethsync;
 extern crate futures;
 extern crate target_info;
 extern crate parity_reactor;
 extern crate path;
 extern crate semver;
+
 
 mod updater;
 mod operations;
