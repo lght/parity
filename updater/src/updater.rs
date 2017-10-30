@@ -321,10 +321,16 @@ impl Updater {
 		}
 
 		if self.do_call.lock().is_none() {
-			if let Some(ops_addr) = self.client.upgrade().and_then(|c| c.registry_address("operations".into())) {
+			if let Some(ops_addr) = self.client.upgrade()
+                .and_then(|c| c.registry_address("operations".into())) 
+            {
 				trace!(target: "updater", "Found operations at {}", ops_addr);
 				let client = self.client.clone();
-				*self.do_call.lock() = Some(Box::new(move |input| client.upgrade().ok_or("No client!".into()).and_then(|c| c.call_contract(BlockId::Latest, ops_addr, input)).map_err(|e| format!("{:?}", e))));
+				*self.do_call.lock() = Some(Box::new(move |input| 
+                                                     client.upgrade()
+                                                     .ok_or("No client!".into())
+                                                     .and_then(|c| c.call_contract(BlockId::Latest, ops_addr, input))
+                                                     .map_err(|e| format!("{:?}", e))));
 			} else {
 				// No Operations contract - bail.
 				return;
@@ -472,7 +478,9 @@ impl Service for Updater {
 pub mod tests {
     use super::*;
     use ethsync::EthSync;
+    use ethsync::test_sync::TestSync;
     use ethcore::client::TestBlockChainClient;
+    use ethcore::spec::Spec;
     use hash_fetch::urlhint::ContractClient;
     use parking_lot::{Condvar, Mutex};
 
@@ -493,9 +501,11 @@ pub mod tests {
         }
 
         pub fn with_policy(update_policy: UpdatePolicy) -> TestUpdater {
-            let sync = EthSync::new_test().unwrap();
+            let spec = Spec::new_test_kovan();
+            let client = Arc::new(TestBlockChainClient::new_with_spec(spec));
+            let weak_client = Arc::downgrade(&client);
+            let sync = TestSync::new_with_client(client).unwrap();
             let weak_sync = Arc::downgrade(&sync);
-            let weak_client = Arc::downgrade(&Arc::new(TestBlockChainClient::new()));
 
 		    let r = Arc::new(Updater {
 		    	update_policy: update_policy,
