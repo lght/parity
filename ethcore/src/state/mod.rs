@@ -21,14 +21,18 @@
 
 use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, BTreeMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY};
 
-use receipt::Receipt;
-use engines::Engine;
-use evm::env_info::EnvInfo;
+use receipt::{Receipt, TransactionOutcome};
+use machine::EthereumMachine as Machine;
+use vm::EnvInfo;
 use error::Error;
 use executive::{Executive, TransactOptions};
 use factory::Factories;
-use trace::FlatTrace;
+use trace::{self, FlatTrace, VMTrace};
 use pod_account::*;
 use pod_state::{self, PodState};
 use types::basic_account::BasicAccount;
@@ -38,10 +42,15 @@ use transaction::SignedTransaction;
 use state_db::StateDB;
 use evm::{Factory as EvmFactory};
 
+use bigint::prelude::U256;
+use bigint::hash::H256;
 use util::*;
+use bytes::Bytes;
 
-use util::trie;
-use util::trie::recorder::Recorder;
+use trie;
+use trie::{Trie, TrieError, TrieDB};
+use trie::recorder::Recorder;
+
 
 mod account;
 mod substate;
@@ -53,15 +62,19 @@ pub use self::backend::Backend;
 pub use self::substate::Substate;
 
 /// Used to return information about an `State::apply` operation.
-pub struct ApplyOutcome {
+pub struct ApplyOutcome<T, V> {
 	/// The receipt for the applied transaction.
 	pub receipt: Receipt,
-	/// The trace for the applied transaction, if None if tracing is disabled.
-	pub trace: Vec<FlatTrace>,
+	/// The output of the applied transaction.
+	pub output: Bytes,
+	/// The trace for the applied transaction, empty if tracing was not produced.
+	pub trace: Vec<T>,
+	/// The VM trace for the applied transaction, None if tracing was not produced.
+	pub vm_trace: Option<V>
 }
 
 /// Result type for the execution ("application") of a transaction.
-pub type ApplyResult = Result<ApplyOutcome, Error>;
+pub type ApplyResult<T, V> = Result<ApplyOutcome<T, V>, Error>;
 
 /// Return type of proof validity check.
 #[derive(Debug, Clone)]
@@ -183,7 +196,7 @@ pub fn check_proof(
 	proof: &[::util::DBValue],
 	root: H256,
 	transaction: &SignedTransaction,
-	engine: &Engine,
+	machine: &Machine,
 	env_info: &EnvInfo,
 ) -> ProvedExecution {
 	let backend = self::backend::ProofCheck::new(proof);
@@ -193,7 +206,7 @@ pub fn check_proof(
 	let res = State::from_existing(
 		backend,
 		root,
-		engine.account_start_nonce(env_info.number),
+		machine.account_start_nonce(env_info.number),
 		factories
 	);
 
@@ -202,10 +215,49 @@ pub fn check_proof(
 		Err(_) => return ProvedExecution::BadProof,
 	};
 
-	match state.execute(env_info, engine, transaction, false, true) {
+	let options = TransactOptions::with_no_tracing().save_output_from_contract();
+	match state.execute(env_info, machine, transaction, options, true) {
 		Ok(executed) => ProvedExecution::Complete(executed),
 		Err(ExecutionError::Internal(_)) => ProvedExecution::BadProof,
 		Err(e) => ProvedExecution::Failed(e),
+	}
+}
+
+/// Prove a transaction on the given state.
+/// Returns `None` when the transacion could not be proved,
+/// and a proof otherwise.
+pub fn prove_transaction<H: AsHashDB + Send + Sync>(
+	db: H,
+	root: H256,
+	transaction: &SignedTransaction,
+	machine: &Machine,
+	env_info: &EnvInfo,
+	factories: Factories,
+	virt: bool,
+) -> Option<(Bytes, Vec<DBValue>)> {
+	use self::backend::Proving;
+
+	let backend = Proving::new(db);
+	let res = State::from_existing(
+		backend,
+		root,
+		machine.account_start_nonce(env_info.number),
+		factories,
+	);
+
+	let mut state = match res {
+		Ok(state) => state,
+		Err(_) => return None,
+	};
+
+	let options = TransactOptions::with_no_tracing().dont_check_nonce().save_output_from_contract();
+	match state.execute(env_info, machine, transaction, options, virt) {
+		Err(ExecutionError::Internal(_)) => None,
+		Err(e) => {
+			trace!(target: "state", "Proved call failed: {}", e);
+			Some((Vec::new(), state.drop().1.extract_proof()))
+		}
+		Ok(res) => Some((res.output, state.drop().1.extract_proof())),
 	}
 }
 
@@ -287,7 +339,7 @@ const SEC_TRIE_DB_UNWRAP_STR: &'static str = "A state can only be created with v
 
 impl<B: Backend> State<B> {
 	/// Creates new state with empty state root
-	#[cfg(test)]
+	/// Used for tests.
 	pub fn new(mut db: B, account_start_nonce: U256, factories: Factories) -> State<B> {
 		let mut root = H256::new();
 		{
@@ -398,22 +450,19 @@ impl<B: Backend> State<B> {
 		//
 		// In all other cases account is read as clean first, and after that made
 		// dirty in and added to the checkpoint with `note_cache`.
-		if account.is_dirty() {
+		let is_dirty = account.is_dirty();
+		let old_value = self.cache.borrow_mut().insert(*address, account);
+		if is_dirty {
 			if let Some(ref mut checkpoint) = self.checkpoints.borrow_mut().last_mut() {
-				if !checkpoint.contains_key(address) {
-					checkpoint.insert(address.clone(), self.cache.borrow_mut().insert(address.clone(), account));
-					return;
-				}
+				checkpoint.entry(*address).or_insert(old_value);
 			}
 		}
-		self.cache.borrow_mut().insert(address.clone(), account);
 	}
 
 	fn note_cache(&self, address: &Address) {
 		if let Some(ref mut checkpoint) = self.checkpoints.borrow_mut().last_mut() {
-			if !checkpoint.contains_key(address) {
-				checkpoint.insert(address.clone(), self.cache.borrow().get(address).map(AccountEntry::clone_dirty));
-			}
+			checkpoint.entry(*address)
+				.or_insert_with(|| self.cache.borrow().get(address).map(AccountEntry::clone_dirty));
 		}
 	}
 
@@ -451,9 +500,10 @@ impl<B: Backend> State<B> {
 		self.ensure_cached(a, RequireCache::None, false, |a| a.map_or(false, |a| !a.is_null()))
 	}
 
-	/// Determine whether an account exists and has code.
-	pub fn exists_and_has_code(&self, a: &Address) -> trie::Result<bool> {
-		self.ensure_cached(a, RequireCache::CodeSize, false, |a| a.map_or(false, |a| a.code_size().map_or(false, |size| size != 0)))
+	/// Determine whether an account exists and has code or non-zero nonce.
+	pub fn exists_and_has_code_or_nonce(&self, a: &Address) -> trie::Result<bool> {
+		self.ensure_cached(a, RequireCache::CodeSize, false,
+			|a| a.map_or(false, |a| a.code_hash() != KECCAK_EMPTY || *a.nonce() != self.account_start_nonce))
 	}
 
 	/// Get the balance of account `a`.
@@ -506,9 +556,8 @@ impl<B: Backend> State<B> {
 				}
 			});
 
-			match trie_res {
-				None => {}
-				Some(res) => return res,
+			if let Some(res) = trie_res {
+				return res;
 			}
 
 			// otherwise cache the account localy and cache storage key there.
@@ -545,7 +594,7 @@ impl<B: Backend> State<B> {
 	/// Get an account's code hash.
 	pub fn code_hash(&self, a: &Address) -> trie::Result<H256> {
 		self.ensure_cached(a, RequireCache::None, true,
-			|a| a.as_ref().map_or(SHA3_EMPTY, |a| a.code_hash()))
+			|a| a.as_ref().map_or(KECCAK_EMPTY, |a| a.code_hash()))
 	}
 
 	/// Get accounts' code size.
@@ -619,31 +668,69 @@ impl<B: Backend> State<B> {
 
 	/// Execute a given transaction, producing a receipt and an optional trace.
 	/// This will change the state accordingly.
-	pub fn apply(&mut self, env_info: &EnvInfo, engine: &Engine, t: &SignedTransaction, tracing: bool) -> ApplyResult {
-//		let old = self.to_pod();
-
-		let e = self.execute(env_info, engine, t, tracing, false)?;
-//		trace!("Applied transaction. Diff:\n{}\n", state_diff::diff_pod(&old, &self.to_pod()));
-		let state_root = if env_info.number < engine.params().eip98_transition || env_info.number < engine.params().validate_receipts_transition {
-			self.commit()?;
-			Some(self.root().clone())
+	pub fn apply(&mut self, env_info: &EnvInfo, machine: &Machine, t: &SignedTransaction, tracing: bool) -> ApplyResult<FlatTrace, VMTrace> {
+		if tracing {
+			let options = TransactOptions::with_tracing();
+			self.apply_with_tracing(env_info, machine, t, options.tracer, options.vm_tracer)
 		} else {
-			None
+			let options = TransactOptions::with_no_tracing();
+			self.apply_with_tracing(env_info, machine, t, options.tracer, options.vm_tracer)
+		}
+	}
+
+	/// Execute a given transaction with given tracer and VM tracer producing a receipt and an optional trace.
+	/// This will change the state accordingly.
+	pub fn apply_with_tracing<V, T>(
+		&mut self,
+		env_info: &EnvInfo,
+		machine: &Machine,
+		t: &SignedTransaction,
+		tracer: T,
+		vm_tracer: V,
+	) -> ApplyResult<T::Output, V::Output> where
+		T: trace::Tracer,
+		V: trace::VMTracer,
+	{
+		let options = TransactOptions::new(tracer, vm_tracer);
+		let e = self.execute(env_info, machine, t, options, false)?;
+		let params = machine.params();
+
+		let eip658 = env_info.number >= params.eip658_transition;
+		let no_intermediate_commits =
+			eip658 ||
+			(env_info.number >= params.eip98_transition && env_info.number >= params.validate_receipts_transition);
+
+		let outcome = if no_intermediate_commits {
+			if eip658 {
+				TransactionOutcome::StatusCode(if e.exception.is_some() { 0 } else { 1 })
+			} else {
+				TransactionOutcome::Unknown
+			}
+		} else {
+			self.commit()?;
+			TransactionOutcome::StateRoot(self.root().clone())
 		};
-		let receipt = Receipt::new(state_root, e.cumulative_gas_used, e.logs);
+
+		let output = e.output;
+		let receipt = Receipt::new(outcome, e.cumulative_gas_used, e.logs);
 		trace!(target: "state", "Transaction receipt: {:?}", receipt);
-		Ok(ApplyOutcome{receipt: receipt, trace: e.trace})
+
+		Ok(ApplyOutcome {
+			receipt,
+			output,
+			trace: e.trace,
+			vm_trace: e.vm_trace,
+		})
 	}
 
 	// Execute a given transaction without committing changes.
 	//
 	// `virt` signals that we are executing outside of a block set and restrictions like
 	// gas limits and gas costs should be lifted.
-	fn execute(&mut self, env_info: &EnvInfo, engine: &Engine, t: &SignedTransaction, tracing: bool, virt: bool)
-		-> Result<Executed, ExecutionError>
+	fn execute<T, V>(&mut self, env_info: &EnvInfo, machine: &Machine, t: &SignedTransaction, options: TransactOptions<T, V>, virt: bool)
+		-> Result<Executed<T::Output, V::Output>, ExecutionError> where T: trace::Tracer, V: trace::VMTracer,
 	{
-		let options = TransactOptions { tracing: tracing, vm_tracing: false, check_nonce: true };
-		let mut e = Executive::new(self, env_info, engine);
+		let mut e = Executive::new(self, env_info, machine);
 
 		match virt {
 			true => e.transact_virtual(t, options),
@@ -727,9 +814,8 @@ impl<B: Backend> State<B> {
 		Ok(())
 	}
 
-	#[cfg(test)]
-	#[cfg(feature = "json-tests")]
 	/// Populate the state from `accounts`.
+	/// Used for tests.
 	pub fn populate_from(&mut self, accounts: PodState) {
 		assert!(self.checkpoints.borrow().is_empty());
 		for (add, acc) in accounts.drain().into_iter() {
@@ -777,27 +863,29 @@ impl<B: Backend> State<B> {
 
 	// load required account data from the databases.
 	fn update_account_cache(require: RequireCache, account: &mut Account, state_db: &B, db: &HashDB) {
-		match (account.is_cached(), require) {
-			(true, _) | (false, RequireCache::None) => {}
-			(false, require) => {
-				// if there's already code in the global cache, always cache it
-				// locally.
-				let hash = account.code_hash();
-				match state_db.get_cached_code(&hash) {
-					Some(code) => account.cache_given_code(code),
-					None => match require {
-						RequireCache::None => {},
-						RequireCache::Code => {
-							if let Some(code) = account.cache_code(db) {
-								// propagate code loaded from the database to
-								// the global code cache.
-								state_db.cache_code(hash, code)
-							}
-						}
-						RequireCache::CodeSize => {
-							account.cache_code_size(db);
-						}
+		if let RequireCache::None = require {
+			return;
+		}
+
+		if account.is_cached() {
+			return;
+		}
+
+		// if there's already code in the global cache, always cache it localy
+		let hash = account.code_hash();
+		match state_db.get_cached_code(&hash) {
+			Some(code) => account.cache_given_code(code),
+			None => match require {
+				RequireCache::None => {},
+				RequireCache::Code => {
+					if let Some(code) = account.cache_code(db) {
+						// propagate code loaded from the database to
+						// the global code cache.
+						state_db.cache_code(hash, code)
 					}
+				},
+				RequireCache::CodeSize => {
+					account.cache_code_size(db);
 				}
 			}
 		}
@@ -847,7 +935,7 @@ impl<B: Backend> State<B> {
 
 	/// Pull account `a` in our cache from the trie DB. `require_code` requires that the code be cached, too.
 	fn require<'a>(&'a self, a: &Address, require_code: bool) -> trie::Result<RefMut<'a, Account>> {
-		self.require_or_from(a, require_code, || Account::new_basic(U256::from(0u8), self.account_start_nonce), |_|{})
+		self.require_or_from(a, require_code, || Account::new_basic(0u8.into(), self.account_start_nonce), |_|{})
 	}
 
 	/// Pull account `a` in our cache from the trie DB. `require_code` requires that the code be cached, too.
@@ -874,7 +962,7 @@ impl<B: Backend> State<B> {
 
 		// at this point the entry is guaranteed to be in the cache.
 		Ok(RefMut::map(self.cache.borrow_mut(), |c| {
-			let mut entry = c.get_mut(a).expect("entry known to exist in the cache; qed");
+			let entry = c.get_mut(a).expect("entry known to exist in the cache; qed");
 
 			match &mut entry.account {
 				&mut Some(ref mut acc) => not_default(acc),
@@ -904,7 +992,7 @@ impl<B: Backend> State<B> {
 	/// Returns a merkle proof of the account's trie node omitted or an encountered trie error.
 	/// If the account doesn't exist in the trie, prove that and return defaults.
 	/// Requires a secure trie to be used for accurate results.
-	/// `account_key` == sha3(address)
+	/// `account_key` == keccak(address)
 	pub fn prove_account(&self, account_key: H256) -> trie::Result<(Vec<Bytes>, BasicAccount)> {
 		let mut recorder = Recorder::new();
 		let trie = TrieDB::new(self.db.as_hashdb(), &self.root)?;
@@ -915,8 +1003,8 @@ impl<B: Backend> State<B> {
 		let account = maybe_account.unwrap_or_else(|| BasicAccount {
 			balance: 0.into(),
 			nonce: self.account_start_nonce,
-			code_hash: SHA3_EMPTY,
-			storage_root: ::util::sha3::SHA3_NULL_RLP,
+			code_hash: KECCAK_EMPTY,
+			storage_root: KECCAK_NULL_RLP,
 		});
 
 		Ok((recorder.drain().into_iter().map(|r| r.data).collect(), account))
@@ -925,11 +1013,11 @@ impl<B: Backend> State<B> {
 	/// Prove an account's storage key's existence or nonexistence in the state.
 	/// Returns a merkle proof of the account's storage trie.
 	/// Requires a secure trie to be used for correctness.
-	/// `account_key` == sha3(address)
-	/// `storage_key` == sha3(key)
+	/// `account_key` == keccak(address)
+	/// `storage_key` == keccak(key)
 	pub fn prove_storage(&self, account_key: H256, storage_key: H256) -> trie::Result<(Vec<Bytes>, H256)> {
 		// TODO: probably could look into cache somehow but it's keyed by
-		// address, not sha3(address).
+		// address, not keccak(address).
 		let trie = TrieDB::new(self.db.as_hashdb(), &self.root)?;
 		let acc = match trie.get_with(&account_key, Account::from_rlp)? {
 			Some(acc) => acc,
@@ -974,15 +1062,18 @@ impl Clone for State<StateDB> {
 
 #[cfg(test)]
 mod tests {
-
 	use std::sync::Arc;
 	use std::str::FromStr;
 	use rustc_hex::FromHex;
+	use hash::keccak;
 	use super::*;
 	use ethkey::Secret;
-	use util::{U256, H256, Address, Hashable};
+	use bigint::prelude::U256;
+	use bigint::hash::H256;
+	use util::Address;
 	use tests::helpers::*;
-	use evm::env_info::EnvInfo;
+	use machine::EthereumMachine;
+	use vm::EnvInfo;
 	use spec::*;
 	use transaction::*;
 	use ethcore_logger::init_log;
@@ -990,7 +1081,13 @@ mod tests {
 	use evm::CallType;
 
 	fn secret() -> Secret {
-		"".sha3().into()
+		keccak("").into()
+	}
+
+	fn make_frontier_machine(max_depth: usize) -> EthereumMachine {
+		let mut machine = ::ethereum::new_frontier_test_machine();
+		machine.set_schedule_creation_rules(Box::new(move |s, _| s.max_depth = max_depth));
+		machine
 	}
 
 	#[test]
@@ -1001,7 +1098,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1013,7 +1110,7 @@ mod tests {
 		}.sign(&secret(), None);
 
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			subtraces: 0,
@@ -1059,7 +1156,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1071,7 +1168,7 @@ mod tests {
 		}.sign(&secret(), None);
 
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			action: trace::Action::Create(trace::Create {
@@ -1095,7 +1192,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1108,7 +1205,7 @@ mod tests {
 
 		state.init_code(&0xa.into(), FromHex::from_hex("6000").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			action: trace::Action::Call(trace::Call {
@@ -1137,7 +1234,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1149,7 +1246,7 @@ mod tests {
 		}.sign(&secret(), None);
 
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			action: trace::Action::Call(trace::Call {
@@ -1178,7 +1275,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = &*Spec::new_test().engine;
+		let machine = Spec::new_test_machine();
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1189,7 +1286,7 @@ mod tests {
 			data: vec![],
 		}.sign(&secret(), None);
 
-		let result = state.apply(&info, engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
@@ -1219,7 +1316,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = &*Spec::new_test().engine;
+		let machine = Spec::new_test_machine();
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1231,7 +1328,7 @@ mod tests {
 		}.sign(&secret(), None);
 
 		state.init_code(&0xa.into(), FromHex::from_hex("600060006000600060006001610be0f1").unwrap()).unwrap();
-		let result = state.apply(&info, engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
@@ -1244,7 +1341,7 @@ mod tests {
 				call_type: CallType::Call,
 			}),
 			result: trace::Res::Call(trace::CallResult {
-				gas_used: U256::from(28_061),
+				gas_used: U256::from(3_721), // in post-eip150
 				output: vec![]
 			}),
 			subtraces: 0,
@@ -1261,7 +1358,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = &*Spec::new_test().engine;
+		let machine = Spec::new_test_machine();
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1274,7 +1371,7 @@ mod tests {
 
 		state.init_code(&0xa.into(), FromHex::from_hex("60006000600060006000600b611000f2").unwrap()).unwrap();
 		state.init_code(&0xb.into(), FromHex::from_hex("6000").unwrap()).unwrap();
-		let result = state.apply(&info, engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
@@ -1288,7 +1385,7 @@ mod tests {
 				call_type: CallType::Call,
 			}),
 			result: trace::Res::Call(trace::CallResult {
-				gas_used: 64.into(),
+				gas_used: 724.into(), // in post-eip150
 				output: vec![]
 			}),
 		}, FlatTrace {
@@ -1320,9 +1417,7 @@ mod tests {
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
 		info.number = 0x789b0;
-		let engine = &*Spec::new_test().engine;
-
-		println!("schedule.have_delegate_call: {:?}", engine.schedule(info.number).have_delegate_call);
+		let machine = Spec::new_test_machine();
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1335,7 +1430,7 @@ mod tests {
 
 		state.init_code(&0xa.into(), FromHex::from_hex("6000600060006000600b618000f4").unwrap()).unwrap();
 		state.init_code(&0xb.into(), FromHex::from_hex("6000").unwrap()).unwrap();
-		let result = state.apply(&info, engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
@@ -1349,7 +1444,7 @@ mod tests {
 				call_type: CallType::Call,
 			}),
 			result: trace::Res::Call(trace::CallResult {
-				gas_used: U256::from(61),
+				gas_used: U256::from(721), // in post-eip150
 				output: vec![]
 			}),
 		}, FlatTrace {
@@ -1380,7 +1475,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1393,7 +1488,7 @@ mod tests {
 
 		state.init_code(&0xa.into(), FromHex::from_hex("5b600056").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			action: trace::Action::Call(trace::Call {
@@ -1419,7 +1514,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1433,7 +1528,7 @@ mod tests {
 		state.init_code(&0xa.into(), FromHex::from_hex("60006000600060006000600b602b5a03f1").unwrap()).unwrap();
 		state.init_code(&0xb.into(), FromHex::from_hex("6000").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
@@ -1478,7 +1573,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1491,7 +1586,7 @@ mod tests {
 
 		state.init_code(&0xa.into(), FromHex::from_hex("60006000600060006045600b6000f1").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			subtraces: 1,
@@ -1532,7 +1627,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1545,7 +1640,7 @@ mod tests {
 
 		state.init_code(&0xa.into(), FromHex::from_hex("600060006000600060ff600b6000f1").unwrap()).unwrap();	// not enough funds.
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			subtraces: 0,
@@ -1574,7 +1669,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1588,7 +1683,7 @@ mod tests {
 		state.init_code(&0xa.into(), FromHex::from_hex("60006000600060006000600b602b5a03f1").unwrap()).unwrap();
 		state.init_code(&0xb.into(), FromHex::from_hex("5b600056").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			subtraces: 1,
@@ -1629,7 +1724,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1644,7 +1739,7 @@ mod tests {
 		state.init_code(&0xb.into(), FromHex::from_hex("60006000600060006000600c602b5a03f1").unwrap()).unwrap();
 		state.init_code(&0xc.into(), FromHex::from_hex("6000").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			subtraces: 1,
@@ -1703,7 +1798,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1718,7 +1813,7 @@ mod tests {
 		state.init_code(&0xb.into(), FromHex::from_hex("60006000600060006000600c602b5a03f1505b601256").unwrap()).unwrap();
 		state.init_code(&0xc.into(), FromHex::from_hex("6000").unwrap()).unwrap();
 		state.add_balance(&t.sender(), &(100.into()), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
@@ -1775,7 +1870,7 @@ mod tests {
 
 		let mut info = EnvInfo::default();
 		info.gas_limit = 1_000_000.into();
-		let engine = TestEngine::new(5);
+		let machine = make_frontier_machine(5);
 
 		let t = Transaction {
 			nonce: 0.into(),
@@ -1789,7 +1884,7 @@ mod tests {
 		state.init_code(&0xa.into(), FromHex::from_hex("73000000000000000000000000000000000000000bff").unwrap()).unwrap();
 		state.add_balance(&0xa.into(), &50.into(), CleanupMode::NoEmpty).unwrap();
 		state.add_balance(&t.sender(), &100.into(), CleanupMode::NoEmpty).unwrap();
-		let result = state.apply(&info, &engine, &t, true).unwrap();
+		let result = state.apply(&info, &machine, &t, true).unwrap();
 		let expected_trace = vec![FlatTrace {
 			trace_address: Default::default(),
 			subtraces: 1,

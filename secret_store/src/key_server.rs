@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::BTreeSet;
 use std::thread;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -24,10 +25,11 @@ use ethcrypto;
 use ethkey;
 use super::acl_storage::AclStorage;
 use super::key_storage::KeyStorage;
+use super::key_server_set::KeyServerSet;
 use key_server_cluster::{math, ClusterCore};
-use traits::{ServerKeyGenerator, DocumentKeyServer, MessageSigner, KeyServer};
+use traits::{AdminSessionsServer, ServerKeyGenerator, DocumentKeyServer, MessageSigner, KeyServer, NodeKeyPair};
 use types::all::{Error, Public, RequestSignature, ServerKeyId, EncryptedDocumentKey, EncryptedDocumentKeyShadow,
-	ClusterConfiguration, MessageHash, EncryptedMessageSignature};
+	ClusterConfiguration, MessageHash, EncryptedMessageSignature, NodeId};
 use key_server_cluster::{ClusterClient, ClusterConfiguration as NetClusterConfiguration};
 
 /// Secret store key server implementation
@@ -44,20 +46,28 @@ pub struct KeyServerCore {
 
 impl KeyServerImpl {
 	/// Create new key server instance
-	pub fn new(config: &ClusterConfiguration, acl_storage: Arc<AclStorage>, key_storage: Arc<KeyStorage>) -> Result<Self, Error> {
+	pub fn new(config: &ClusterConfiguration, key_server_set: Arc<KeyServerSet>, self_key_pair: Arc<NodeKeyPair>, acl_storage: Arc<AclStorage>, key_storage: Arc<KeyStorage>) -> Result<Self, Error> {
 		Ok(KeyServerImpl {
-			data: Arc::new(Mutex::new(KeyServerCore::new(config, acl_storage, key_storage)?)),
+			data: Arc::new(Mutex::new(KeyServerCore::new(config, key_server_set, self_key_pair, acl_storage, key_storage)?)),
 		})
 	}
 
-	#[cfg(test)]
 	/// Get cluster client reference.
+	#[cfg(test)]
 	pub fn cluster(&self) -> Arc<ClusterClient> {
 		self.data.lock().cluster.clone()
 	}
 }
 
 impl KeyServer for KeyServerImpl {}
+
+impl AdminSessionsServer for KeyServerImpl {
+	fn change_servers_set(&self, old_set_signature: RequestSignature, new_set_signature: RequestSignature, new_servers_set: BTreeSet<NodeId>) -> Result<(), Error> {
+		let servers_set_change_session = self.data.lock().cluster
+			.new_servers_set_change_session(None, new_servers_set, old_set_signature, new_set_signature)?;
+		servers_set_change_session.wait().map_err(Into::into)
+	}
+}
 
 impl ServerKeyGenerator for KeyServerImpl {
 	fn generate_key(&self, key_id: &ServerKeyId, signature: &RequestSignature, threshold: usize) -> Result<Public, Error> {
@@ -105,7 +115,7 @@ impl DocumentKeyServer for KeyServerImpl {
 			.map_err(|_| Error::BadSignature)?;
 
 		// decrypt document key
-		let decryption_session = self.data.lock().cluster.new_decryption_session(key_id.clone(), signature.clone(), false)?;
+		let decryption_session = self.data.lock().cluster.new_decryption_session(key_id.clone(), signature.clone(), None, false)?;
 		let document_key = decryption_session.wait()?.decrypted_secret;
 
 		// encrypt document key with requestor public key
@@ -115,7 +125,7 @@ impl DocumentKeyServer for KeyServerImpl {
 	}
 
 	fn restore_document_key_shadow(&self, key_id: &ServerKeyId, signature: &RequestSignature) -> Result<EncryptedDocumentKeyShadow, Error> {
-		let decryption_session = self.data.lock().cluster.new_decryption_session(key_id.clone(), signature.clone(), true)?;
+		let decryption_session = self.data.lock().cluster.new_decryption_session(key_id.clone(), signature.clone(), None, true)?;
 		decryption_session.wait().map_err(Into::into)
 	}
 }
@@ -127,7 +137,7 @@ impl MessageSigner for KeyServerImpl {
 			.map_err(|_| Error::BadSignature)?;
 
 		// sign message
-		let signing_session = self.data.lock().cluster.new_signing_session(key_id.clone(), signature.clone(), message)?;
+		let signing_session = self.data.lock().cluster.new_signing_session(key_id.clone(), signature.clone(), None, message)?;
 		let message_signature = signing_session.wait()?;
 
 		// compose two message signature components into single one
@@ -143,17 +153,16 @@ impl MessageSigner for KeyServerImpl {
 }
 
 impl KeyServerCore {
-	pub fn new(config: &ClusterConfiguration, acl_storage: Arc<AclStorage>, key_storage: Arc<KeyStorage>) -> Result<Self, Error> {
+	pub fn new(config: &ClusterConfiguration, key_server_set: Arc<KeyServerSet>, self_key_pair: Arc<NodeKeyPair>, acl_storage: Arc<AclStorage>, key_storage: Arc<KeyStorage>) -> Result<Self, Error> {
 		let config = NetClusterConfiguration {
 			threads: config.threads,
-			self_key_pair: ethkey::KeyPair::from_secret_slice(&config.self_private)?,
+			self_key_pair: self_key_pair,
 			listen_address: (config.listener_address.address.clone(), config.listener_address.port),
-			nodes: config.nodes.iter()
-				.map(|(node_id, node_address)| (node_id.clone(), (node_address.address.clone(), node_address.port)))
-				.collect(),
+			key_server_set: key_server_set,
 			allow_connecting_to_higher_nodes: config.allow_connecting_to_higher_nodes,
 			acl_storage: acl_storage,
 			key_storage: key_storage,
+			admin_public: config.admin_public.clone(),
 		};
 
 		let (stop, stopped) = futures::oneshot();
@@ -191,22 +200,33 @@ impl Drop for KeyServerCore {
 
 #[cfg(test)]
 pub mod tests {
+	use std::collections::BTreeSet;
 	use std::time;
 	use std::sync::Arc;
+	use std::net::SocketAddr;
+	use std::collections::BTreeMap;
 	use ethcrypto;
 	use ethkey::{self, Secret, Random, Generator};
-	use acl_storage::tests::DummyAclStorage;
+	use acl_storage::DummyAclStorage;
 	use key_storage::tests::DummyKeyStorage;
+	use node_key_pair::PlainNodeKeyPair;
+	use key_server_set::tests::MapKeyServerSet;
 	use key_server_cluster::math;
-	use util::H256;
+	use bigint::hash::H256;
 	use types::all::{Error, Public, ClusterConfiguration, NodeAddress, RequestSignature, ServerKeyId,
-		EncryptedDocumentKey, EncryptedDocumentKeyShadow, MessageHash, EncryptedMessageSignature};
-	use traits::{ServerKeyGenerator, DocumentKeyServer, MessageSigner, KeyServer};
+		EncryptedDocumentKey, EncryptedDocumentKeyShadow, MessageHash, EncryptedMessageSignature, NodeId};
+	use traits::{AdminSessionsServer, ServerKeyGenerator, DocumentKeyServer, MessageSigner, KeyServer};
 	use super::KeyServerImpl;
 
 	pub struct DummyKeyServer;
 
 	impl KeyServer for DummyKeyServer {}
+
+	impl AdminSessionsServer for DummyKeyServer {
+		fn change_servers_set(&self, _old_set_signature: RequestSignature, _new_set_signature: RequestSignature, _new_servers_set: BTreeSet<NodeId>) -> Result<(), Error> {
+			unimplemented!()
+		}
+	}
 
 	impl ServerKeyGenerator for DummyKeyServer {
 		fn generate_key(&self, _key_id: &ServerKeyId, _signature: &RequestSignature, _threshold: usize) -> Result<Public, Error> {
@@ -242,7 +262,6 @@ pub mod tests {
 		let key_pairs: Vec<_> = (0..num_nodes).map(|_| Random.generate().unwrap()).collect();
 		let configs: Vec<_> = (0..num_nodes).map(|i| ClusterConfiguration {
 				threads: 1,
-				self_private: (***key_pairs[i].secret()).into(),
 				listener_address: NodeAddress {
 					address: "127.0.0.1".into(),
 					port: start_port + (i as u16),
@@ -253,9 +272,16 @@ pub mod tests {
 						port: start_port + (j as u16),
 					})).collect(),
 				allow_connecting_to_higher_nodes: false,
+				admin_public: None,
 			}).collect();
-		let key_servers: Vec<_> = configs.into_iter().map(|cfg|
-			KeyServerImpl::new(&cfg, Arc::new(DummyAclStorage::default()), Arc::new(DummyKeyStorage::default())).unwrap()
+		let key_servers_set: BTreeMap<Public, SocketAddr> = configs[0].nodes.iter()
+			.map(|(k, a)| (k.clone(), format!("{}:{}", a.address, a.port).parse().unwrap()))
+			.collect();
+		let key_servers: Vec<_> = configs.into_iter().enumerate().map(|(i, cfg)|
+			KeyServerImpl::new(&cfg, Arc::new(MapKeyServerSet::new(key_servers_set.clone())),
+				Arc::new(PlainNodeKeyPair::new(key_pairs[i].clone())),
+				Arc::new(DummyAclStorage::default()),
+				Arc::new(DummyKeyStorage::default())).unwrap()
 		).collect();
 
 		// wait until connections are established. It is fast => do not bother with events here
@@ -385,5 +411,58 @@ pub mod tests {
 			// check signature
 			assert_eq!(math::verify_signature(&server_public, &(signature_c, signature_s), &message_hash), Ok(true));
 		}
+	}
+
+	#[test]
+	fn decryption_session_is_delegated_when_node_does_not_have_key_share() {
+		//::logger::init_log();
+		let key_servers = make_key_servers(6110, 3);
+
+		// generate document key
+		let threshold = 0;
+		let document = Random.generate().unwrap().secret().clone();
+		let secret = Random.generate().unwrap().secret().clone();
+		let signature = ethkey::sign(&secret, &document).unwrap();
+		let generated_key = key_servers[0].generate_document_key(&document, &signature, threshold).unwrap();
+		let generated_key = ethcrypto::ecies::decrypt(&secret, &ethcrypto::DEFAULT_MAC, &generated_key).unwrap();
+
+		// remove key from node0
+		key_servers[0].cluster().key_storage().remove(&document).unwrap();
+
+		// now let's try to retrieve key back by requesting it from node0, so that session must be delegated
+		let retrieved_key = key_servers[0].restore_document_key(&document, &signature).unwrap();
+		let retrieved_key = ethcrypto::ecies::decrypt(&secret, &ethcrypto::DEFAULT_MAC, &retrieved_key).unwrap();
+		assert_eq!(retrieved_key, generated_key);
+	}
+
+	#[test]
+	fn signing_session_is_delegated_when_node_does_not_have_key_share() {
+		//::logger::init_log();
+		let key_servers = make_key_servers(6114, 3);
+		let threshold = 1;
+
+		// generate server key
+		let server_key_id = Random.generate().unwrap().secret().clone();
+		let requestor_secret = Random.generate().unwrap().secret().clone();
+		let signature = ethkey::sign(&requestor_secret, &server_key_id).unwrap();
+		let server_public = key_servers[0].generate_key(&server_key_id, &signature, threshold).unwrap();
+
+		// remove key from node0
+		key_servers[0].cluster().key_storage().remove(&server_key_id).unwrap();
+
+		// sign message
+		let message_hash = H256::from(42);
+		let combined_signature = key_servers[0].sign_message(&server_key_id, &signature, message_hash.clone()).unwrap();
+		let combined_signature = ethcrypto::ecies::decrypt(&requestor_secret, &ethcrypto::DEFAULT_MAC, &combined_signature).unwrap();
+		let signature_c = Secret::from_slice(&combined_signature[..32]);
+		let signature_s = Secret::from_slice(&combined_signature[32..]);
+
+		// check signature
+		assert_eq!(math::verify_signature(&server_public, &(signature_c, signature_s), &message_hash), Ok(true));
+	}
+
+	#[test]
+	fn servers_set_change_session_works_over_network() {
+		// TODO
 	}
 }

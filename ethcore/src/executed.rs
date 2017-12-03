@@ -16,8 +16,11 @@
 
 //! Transaction execution format module.
 
-use util::{Bytes, U256, Address, U512, trie};
-use evm;
+use bigint::prelude::{U256, U512};
+use util::Address;
+use bytes::Bytes;
+use trie;
+use vm;
 use trace::{VMTrace, FlatTrace};
 use log_entry::LogEntry;
 use state_diff::StateDiff;
@@ -26,9 +29,9 @@ use std::fmt;
 
 /// Transaction execution receipt.
 #[derive(Debug, PartialEq, Clone)]
-pub struct Executed {
+pub struct Executed<T = FlatTrace, V = VMTrace> {
 	/// True if the outer call/create resulted in an exceptional exit.
-	pub exception: Option<evm::Error>,
+	pub exception: Option<vm::Error>,
 
 	/// Gas paid up front for execution of transaction.
 	pub gas: U256,
@@ -60,9 +63,9 @@ pub struct Executed {
 	/// Transaction output.
 	pub output: Bytes,
 	/// The trace of this transaction.
-	pub trace: Vec<FlatTrace>,
+	pub trace: Vec<T>,
 	/// The VM trace of this transaction.
-	pub vm_trace: Option<VMTrace>,
+	pub vm_trace: Option<V>,
 	/// The state diff, if we traced it.
 	pub state_diff: Option<StateDiff>,
 }

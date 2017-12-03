@@ -33,17 +33,24 @@ pub use self::localized::LocalizedTrace;
 
 pub use self::types::{filter, flat, localized, trace};
 pub use self::types::error::Error as TraceError;
-pub use self::types::trace::{VMTrace, VMOperation, VMExecutedOperation, MemoryDiff, StorageDiff};
+pub use self::types::trace::{VMTrace, VMOperation, VMExecutedOperation, MemoryDiff, StorageDiff, RewardType};
 pub use self::types::flat::{FlatTrace, FlatTransactionTraces, FlatBlockTraces};
 pub use self::types::filter::{Filter, AddressesFilter};
 
-use util::{Bytes, Address, U256, H256, DBTransaction};
+use bigint::prelude::U256;
+use bigint::hash::H256;
+use util::Address;
+use kvdb::DBTransaction;
+use bytes::Bytes;
 use self::trace::{Call, Create};
-use evm::action_params::ActionParams;
+use vm::ActionParams;
 use header::BlockNumber;
 
 /// This trait is used by executive to build traces.
 pub trait Tracer: Send {
+	/// Data returned when draining the Tracer.
+	type Output;
+
 	/// Prepares call trace for given params. Noop tracer should return None.
 	fn prepare_trace_call(&self, params: &ActionParams) -> Option<Call>;
 
@@ -59,7 +66,7 @@ pub trait Tracer: Send {
 		call: Option<Call>,
 		gas_used: U256,
 		output: Option<Bytes>,
-		subs: Vec<FlatTrace>,
+		subs: Vec<Self::Output>,
 	);
 
 	/// Stores trace create info.
@@ -69,27 +76,33 @@ pub trait Tracer: Send {
 		gas_used: U256,
 		code: Option<Bytes>,
 		address: Address,
-		subs: Vec<FlatTrace>
+		subs: Vec<Self::Output>
 	);
 
 	/// Stores failed call trace.
-	fn trace_failed_call(&mut self, call: Option<Call>, subs: Vec<FlatTrace>, error: TraceError);
+	fn trace_failed_call(&mut self, call: Option<Call>, subs: Vec<Self::Output>, error: TraceError);
 
 	/// Stores failed create trace.
-	fn trace_failed_create(&mut self, create: Option<Create>, subs: Vec<FlatTrace>, error: TraceError);
+	fn trace_failed_create(&mut self, create: Option<Create>, subs: Vec<Self::Output>, error: TraceError);
 
 	/// Stores suicide info.
 	fn trace_suicide(&mut self, address: Address, balance: U256, refund_address: Address);
+
+	/// Stores reward info.
+	fn trace_reward(&mut self, author: Address, value: U256, reward_type: RewardType);
 
 	/// Spawn subtracer which will be used to trace deeper levels of execution.
 	fn subtracer(&self) -> Self where Self: Sized;
 
 	/// Consumes self and returns all traces.
-	fn traces(self) -> Vec<FlatTrace>;
+	fn drain(self) -> Vec<Self::Output>;
 }
 
 /// Used by executive to build VM traces.
 pub trait VMTracer: Send {
+
+	/// Data returned when draining the VMTracer.
+	type Output;
 
 	/// Trace the progression of interpreter to next instruction.
 	/// If tracer returns `false` it won't be called again.
@@ -109,7 +122,7 @@ pub trait VMTracer: Send {
 	fn done_subtrace(&mut self, sub: Self) where Self: Sized;
 
 	/// Consumes self and returns the VM trace.
-	fn drain(self) -> Option<VMTrace>;
+	fn drain(self) -> Option<Self::Output>;
 }
 
 /// `DbExtras` provides an interface to query extra data which is not stored in tracesdb,

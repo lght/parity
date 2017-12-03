@@ -15,8 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::cmp::PartialEq;
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
@@ -27,17 +26,19 @@ use ethcore::account_provider::AccountProvider;
 use ethcore::client::Client;
 use ethcore::miner::{Miner, ExternalMiner};
 use ethcore::snapshot::SnapshotService;
-use parity_rpc::{Metadata, NetworkSettings};
-use parity_rpc::informant::{ActivityNotifier, ClientNotifier};
-use parity_rpc::dispatch::{FullDispatcher, LightDispatcher};
+use ethcore_logger::RotatingLogger;
 use ethsync::{ManageNetwork, SyncProvider, LightSync};
 use hash_fetch::fetch::Client as FetchClient;
 use jsonrpc_core::{self as core, MetaIoHandler};
 use light::{TransactionQueue as LightTransactionQueue, Cache as LightDataCache};
-use updater::Updater;
-use util::{Mutex, RwLock};
-use ethcore_logger::RotatingLogger;
+use light::client::LightChainClient;
+use node_health::NodeHealth;
 use parity_reactor;
+use parity_rpc::dispatch::{FullDispatcher, LightDispatcher};
+use parity_rpc::informant::{ActivityNotifier, ClientNotifier};
+use parity_rpc::{Metadata, NetworkSettings, Host};
+use updater::Updater;
+use parking_lot::{Mutex, RwLock};
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
 pub enum Api {
@@ -217,10 +218,11 @@ pub struct FullDependencies {
 	pub settings: Arc<NetworkSettings>,
 	pub net_service: Arc<ManageNetwork>,
 	pub updater: Arc<Updater>,
+	pub health: NodeHealth,
 	pub geth_compatibility: bool,
 	pub dapps_service: Option<Arc<DappsService>>,
-	pub dapps_address: Option<(String, u16)>,
-	pub ws_address: Option<(String, u16)>,
+	pub dapps_address: Option<Host>,
+	pub ws_address: Option<Host>,
 	pub fetch: FetchClient,
 	pub remote: parity_reactor::Remote,
 	pub whisper_rpc: Option<::whisper::RpcFactory>,
@@ -236,12 +238,12 @@ impl FullDependencies {
 		use parity_rpc::v1::*;
 
 		macro_rules! add_signing_methods {
-			($namespace:ident, $handler:expr, $deps:expr) => {
+			($namespace:ident, $handler:expr, $deps:expr, $nonces:expr) => {
 				{
 					let deps = &$deps;
-					let dispatcher = FullDispatcher::new(deps.client.clone(), deps.miner.clone());
+					let dispatcher = FullDispatcher::new(deps.client.clone(), deps.miner.clone(), $nonces);
 					if deps.signer_service.is_enabled() {
-						$handler.extend_with($namespace::to_delegate(SigningQueueClient::new(&deps.signer_service, dispatcher, &deps.secret_store)))
+						$handler.extend_with($namespace::to_delegate(SigningQueueClient::new(&deps.signer_service, dispatcher, deps.remote.clone(), &deps.secret_store)))
 					} else {
 						$handler.extend_with($namespace::to_delegate(SigningUnsafeClient::new(&deps.secret_store, dispatcher)))
 					}
@@ -249,7 +251,12 @@ impl FullDependencies {
 			}
 		}
 
-		let dispatcher = FullDispatcher::new(self.client.clone(), self.miner.clone());
+		let nonces = Arc::new(Mutex::new(dispatch::Reservations::with_pool(self.fetch.pool())));
+		let dispatcher = FullDispatcher::new(
+			self.client.clone(),
+			self.miner.clone(),
+			nonces.clone(),
+		);
 		for api in apis {
 			match *api {
 				Api::Web3 => {
@@ -278,16 +285,18 @@ impl FullDependencies {
 						let filter_client = EthFilterClient::new(self.client.clone(), self.miner.clone());
 						handler.extend_with(filter_client.to_delegate());
 
-						add_signing_methods!(EthSigning, handler, self);
+						add_signing_methods!(EthSigning, handler, self, nonces.clone());
 					}
 				},
 				Api::EthPubSub => {
-					let client = EthPubSubClient::new(self.client.clone(), self.remote.clone());
-					self.client.add_notify(client.handler());
-					handler.extend_with(client.to_delegate());
+					if !for_generic_pubsub {
+						let client = EthPubSubClient::new(self.client.clone(), self.remote.clone());
+						self.client.add_notify(client.handler());
+						handler.extend_with(client.to_delegate());
+					}
 				},
 				Api::Personal => {
-					handler.extend_with(PersonalClient::new(&self.secret_store, dispatcher.clone(), self.geth_compatibility).to_delegate());
+					handler.extend_with(PersonalClient::new(self.secret_store.clone(), dispatcher.clone(), self.geth_compatibility).to_delegate());
 				},
 				Api::Signer => {
 					handler.extend_with(SignerClient::new(&self.secret_store, dispatcher.clone(), &self.signer_service, self.remote.clone()).to_delegate());
@@ -298,12 +307,13 @@ impl FullDependencies {
 						false => None,
 					};
 					handler.extend_with(ParityClient::new(
-						&self.client,
-						&self.miner,
-						&self.sync,
-						&self.updater,
-						&self.net_service,
-						&self.secret_store,
+						self.client.clone(),
+						self.miner.clone(),
+						self.sync.clone(),
+						self.updater.clone(),
+						self.net_service.clone(),
+						self.health.clone(),
+						self.secret_store.clone(),
 						self.logger.clone(),
 						self.settings.clone(),
 						signer,
@@ -312,7 +322,7 @@ impl FullDependencies {
 					).to_delegate());
 
 					if !for_generic_pubsub {
-						add_signing_methods!(ParitySigning, handler, self);
+						add_signing_methods!(ParitySigning, handler, self, nonces.clone());
 					}
 				},
 				Api::ParityPubSub => {
@@ -337,7 +347,7 @@ impl FullDependencies {
 					).to_delegate())
 				},
 				Api::Traces => {
-					handler.extend_with(TracesClient::new(&self.client, &self.miner).to_delegate())
+					handler.extend_with(TracesClient::new(&self.client).to_delegate())
 				},
 				Api::Rpc => {
 					let modules = to_modules(&apis);
@@ -348,14 +358,18 @@ impl FullDependencies {
 				},
 				Api::Whisper => {
 					if let Some(ref whisper_rpc) = self.whisper_rpc {
-						let whisper = whisper_rpc.make_handler();
+						let whisper = whisper_rpc.make_handler(self.net.clone());
 						handler.extend_with(::parity_whisper::rpc::Whisper::to_delegate(whisper));
 					}
 				}
 				Api::WhisperPubSub => {
-					if let Some(ref whisper_rpc) = self.whisper_rpc {
-						let whisper = whisper_rpc.make_handler();
-						handler.extend_with(::parity_whisper::rpc::WhisperPubSub::to_delegate(whisper));
+					if !for_generic_pubsub {
+						if let Some(ref whisper_rpc) = self.whisper_rpc {
+							let whisper = whisper_rpc.make_handler(self.net.clone());
+							handler.extend_with(
+								::parity_whisper::rpc::WhisperPubSub::to_delegate(whisper)
+							);
+						}
 					}
 				}
 			}
@@ -389,27 +403,28 @@ impl ActivityNotifier for LightClientNotifier {
 }
 
 /// RPC dependencies for a light client.
-pub struct LightDependencies {
+pub struct LightDependencies<T> {
 	pub signer_service: Arc<SignerService>,
-	pub client: Arc<::light::client::Client>,
+	pub client: Arc<T>,
 	pub sync: Arc<LightSync>,
 	pub net: Arc<ManageNetwork>,
 	pub secret_store: Arc<AccountProvider>,
 	pub logger: Arc<RotatingLogger>,
 	pub settings: Arc<NetworkSettings>,
+	pub health: NodeHealth,
 	pub on_demand: Arc<::light::on_demand::OnDemand>,
 	pub cache: Arc<Mutex<LightDataCache>>,
 	pub transaction_queue: Arc<RwLock<LightTransactionQueue>>,
 	pub dapps_service: Option<Arc<DappsService>>,
-	pub dapps_address: Option<(String, u16)>,
-	pub ws_address: Option<(String, u16)>,
+	pub dapps_address: Option<Host>,
+	pub ws_address: Option<Host>,
 	pub fetch: FetchClient,
 	pub geth_compatibility: bool,
 	pub remote: parity_reactor::Remote,
 	pub whisper_rpc: Option<::whisper::RpcFactory>,
 }
 
-impl LightDependencies {
+impl<C: LightChainClient + 'static> LightDependencies<C> {
 	fn extend_api<T: core::Middleware<Metadata>>(
 		&self,
 		handler: &mut MetaIoHandler<Metadata, T>,
@@ -424,6 +439,7 @@ impl LightDependencies {
 			self.on_demand.clone(),
 			self.cache.clone(),
 			self.transaction_queue.clone(),
+			Arc::new(Mutex::new(dispatch::Reservations::with_pool(self.fetch.pool()))),
 		);
 
 		macro_rules! add_signing_methods {
@@ -434,7 +450,7 @@ impl LightDependencies {
 					let secret_store = Some(deps.secret_store.clone());
 					if deps.signer_service.is_enabled() {
 						$handler.extend_with($namespace::to_delegate(
-							SigningQueueClient::new(&deps.signer_service, dispatcher, &secret_store)
+							SigningQueueClient::new(&deps.signer_service, dispatcher, deps.remote.clone(), &secret_store)
 						))
 					} else {
 						$handler.extend_with(
@@ -484,7 +500,7 @@ impl LightDependencies {
 				},
 				Api::Personal => {
 					let secret_store = Some(self.secret_store.clone());
-					handler.extend_with(PersonalClient::new(&secret_store, dispatcher.clone(), self.geth_compatibility).to_delegate());
+					handler.extend_with(PersonalClient::new(secret_store, dispatcher.clone(), self.geth_compatibility).to_delegate());
 				},
 				Api::Signer => {
 					let secret_store = Some(self.secret_store.clone());
@@ -501,6 +517,7 @@ impl LightDependencies {
 						self.secret_store.clone(),
 						self.logger.clone(),
 						self.settings.clone(),
+						self.health.clone(),
 						signer,
 						self.dapps_address.clone(),
 						self.ws_address.clone(),
@@ -542,13 +559,13 @@ impl LightDependencies {
 				},
 				Api::Whisper => {
 					if let Some(ref whisper_rpc) = self.whisper_rpc {
-						let whisper = whisper_rpc.make_handler();
+						let whisper = whisper_rpc.make_handler(self.net.clone());
 						handler.extend_with(::parity_whisper::rpc::Whisper::to_delegate(whisper));
 					}
 				}
 				Api::WhisperPubSub => {
 					if let Some(ref whisper_rpc) = self.whisper_rpc {
-						let whisper = whisper_rpc.make_handler();
+						let whisper = whisper_rpc.make_handler(self.net.clone());
 						handler.extend_with(::parity_whisper::rpc::WhisperPubSub::to_delegate(whisper));
 					}
 				}
@@ -557,7 +574,7 @@ impl LightDependencies {
 	}
 }
 
-impl Dependencies for LightDependencies {
+impl<T: LightChainClient + 'static> Dependencies for LightDependencies<T> {
 	type Notifier = LightClientNotifier;
 
 	fn activity_notifier(&self) -> Self::Notifier { LightClientNotifier }

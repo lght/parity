@@ -18,7 +18,7 @@
 
 use std::fmt;
 use rlp::{Encodable, RlpStream, Decodable, DecoderError, UntrustedRlp};
-use evm::Error as EvmError;
+use vm::Error as VmError;
 
 /// Trace evm errors.
 #[derive(Debug, PartialEq, Clone)]
@@ -43,26 +43,32 @@ pub enum Error {
 	MutableCallInStaticContext,
 	/// Wasm error
 	Wasm,
+	/// Contract tried to access past the return data buffer.
+	OutOfBounds,
+	/// Execution has been reverted with REVERT instruction.
+	Reverted,
 }
 
-impl<'a> From<&'a EvmError> for Error {
-	fn from(e: &'a EvmError) -> Self {
+impl<'a> From<&'a VmError> for Error {
+	fn from(e: &'a VmError) -> Self {
 		match *e {
-			EvmError::OutOfGas => Error::OutOfGas,
-			EvmError::BadJumpDestination { .. } => Error::BadJumpDestination,
-			EvmError::BadInstruction { .. } => Error::BadInstruction,
-			EvmError::StackUnderflow { .. } => Error::StackUnderflow,
-			EvmError::OutOfStack { .. } => Error::OutOfStack,
-			EvmError::BuiltIn { .. } => Error::BuiltIn,
-			EvmError::Wasm { .. } => Error::Wasm,
-			EvmError::Internal(_) => Error::Internal,
-			EvmError::MutableCallInStaticContext => Error::MutableCallInStaticContext,
+			VmError::OutOfGas => Error::OutOfGas,
+			VmError::BadJumpDestination { .. } => Error::BadJumpDestination,
+			VmError::BadInstruction { .. } => Error::BadInstruction,
+			VmError::StackUnderflow { .. } => Error::StackUnderflow,
+			VmError::OutOfStack { .. } => Error::OutOfStack,
+			VmError::BuiltIn { .. } => Error::BuiltIn,
+			VmError::Wasm { .. } => Error::Wasm,
+			VmError::Internal(_) => Error::Internal,
+			VmError::MutableCallInStaticContext => Error::MutableCallInStaticContext,
+			VmError::OutOfBounds => Error::OutOfBounds,
+			VmError::Reverted => Error::Reverted,
 		}
 	}
 }
 
-impl From<EvmError> for Error {
-	fn from(e: EvmError) -> Self {
+impl From<VmError> for Error {
+	fn from(e: VmError) -> Self {
 		Error::from(&e)
 	}
 }
@@ -80,6 +86,8 @@ impl fmt::Display for Error {
 			Wasm => "Wasm runtime error",
 			Internal => "Internal error",
 			MutableCallInStaticContext => "Mutable Call In Static Context",
+			OutOfBounds => "Out of bounds",
+			Reverted => "Reverted",
 		};
 		message.fmt(f)
 	}
@@ -98,6 +106,8 @@ impl Encodable for Error {
 			BuiltIn => 6,
 			MutableCallInStaticContext => 7,
 			Wasm => 8,
+			OutOfBounds => 9,
+			Reverted => 10,
 		};
 
 		s.append_internal(&value);
@@ -118,6 +128,8 @@ impl Decodable for Error {
 			6 => Ok(BuiltIn),
 			7 => Ok(MutableCallInStaticContext),
 			8 => Ok(Wasm),
+			9 => Ok(OutOfBounds),
+			10 => Ok(Reverted),
 			_ => Err(DecoderError::Custom("Invalid error type")),
 		}
 	}

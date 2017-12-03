@@ -32,7 +32,7 @@ use request::{CompleteRequest, Kind};
 
 use bincode;
 use time;
-use util::{RwLock, Mutex};
+use parking_lot::{RwLock, Mutex};
 
 /// Number of time periods samples should be kept for.
 pub const MOVING_SAMPLE_SIZE: usize = 256;
@@ -62,6 +62,7 @@ fn hardcoded_serve_time(kind: Kind) -> u64 {
 		Kind::Storage => 2_000_000,
 		Kind::Code => 1_500_000,
 		Kind::Execution => 250, // per gas.
+		Kind::Signal => 500_000,
 	}
 }
 
@@ -263,8 +264,9 @@ mod tests {
 
 	#[test]
 	fn file_store() {
-		let path = ::devtools::RandomTempPath::new();
-		let store = FileStore(path.as_path().clone());
+		let tempdir = ::tempdir::TempDir::new("").unwrap();
+		let path = tempdir.path().join("file");
+		let store = FileStore(path);
 
 		let mut samples = store.load();
 		assert!(samples.is_empty());

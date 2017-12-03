@@ -20,7 +20,7 @@ use std::fmt;
 use rlp::DecoderError;
 use ethcore::error::{Error as EthcoreError, CallError, TransactionError};
 use ethcore::account_provider::{SignError as AccountError};
-use jsonrpc_core::{Error, ErrorCode, Value};
+use jsonrpc_core::{futures, Error, ErrorCode, Value};
 
 mod codes {
 	// NOTE [ToDr] Codes from [-32099, -32000]
@@ -68,6 +68,14 @@ pub fn public_unsupported(details: Option<String>) -> Error {
 		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "Method disallowed when running parity as a public node.".into(),
 		data: details.map(Value::String),
+	}
+}
+
+pub fn unsupported<T: Into<String>>(msg: T, details: Option<T>) -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
+		message: msg.into(),
+		data: details.map(Into::into).map(Value::String),
 	}
 }
 
@@ -302,11 +310,12 @@ pub fn transaction_message(error: TransactionError) -> String {
 		GasLimitExceeded { limit, got } => {
 			format!("Transaction cost exceeds current gas limit. Limit: {}, got: {}. Try decreasing supplied gas.", limit, got)
 		},
-		InvalidNetworkId => "Invalid network id.".into(),
+		InvalidChainId => "Invalid chain id.".into(),
 		InvalidGasLimit(_) => "Supplied gas is beyond limit.".into(),
 		SenderBanned => "Sender is banned in local queue.".into(),
 		RecipientBanned => "Recipient is banned in local queue.".into(),
 		CodeBanned => "Code is banned in local queue.".into(),
+		NotAllowed => "Transaction is not permitted.".into(),
 	}
 }
 
@@ -370,6 +379,6 @@ pub fn deprecated<T: Into<Option<String>>>(message: T) -> Error {
 }
 
 // on-demand sender cancelled.
-pub fn on_demand_cancel(_cancel: ::futures::sync::oneshot::Canceled) -> Error {
+pub fn on_demand_cancel(_cancel: futures::sync::oneshot::Canceled) -> Error {
 	internal("on-demand sender cancelled", "")
 }

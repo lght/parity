@@ -17,11 +17,11 @@
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 use std::io;
-use util::Bytes;
+use bytes::Bytes;
 use network::{NetworkProtocolHandler, NetworkService, NetworkContext, HostInfo, PeerId, ProtocolId,
-	NetworkConfiguration as BasicNetworkConfiguration, NonReservedPeerMode, NetworkError,
-	AllowIP as NetworkAllowIP};
-use util::{U256, H256, H512};
+	NetworkConfiguration as BasicNetworkConfiguration, NonReservedPeerMode, Error, ErrorKind, ConnectionFilter};
+use bigint::prelude::U256;
+use bigint::hash::{H256, H512};
 use io::{TimerToken};
 use ethcore::ethstore::ethkey::Secret;
 use ethcore::client::{BlockChainClient, ChainNotify};
@@ -30,13 +30,13 @@ use ethcore::header::BlockNumber;
 use sync_io::NetSyncIo;
 use chain::{ChainSync, SyncStatus as EthSyncStatus};
 use std::net::{SocketAddr, AddrParseError};
-use ipc::{BinaryConvertable, BinaryConvertError, IpcConfig};
 use std::str::FromStr;
 use parking_lot::RwLock;
 use chain::{ETH_PACKET_COUNT, SNAPSHOT_SYNC_PACKET_COUNT};
 use light::client::AsLightClient;
 use light::Provider;
 use light::net::{self as light_net, LightProtocol, Params as LightParams, Capabilities, Handler as LightHandler, EventContext};
+use network::IpFilter;
 
 /// Parity sync protocol
 pub const WARP_SYNC_PROTOCOL_ID: ProtocolId = *b"par";
@@ -81,9 +81,6 @@ impl Default for SyncConfig {
 	}
 }
 
-binary_fixed_size!(SyncConfig);
-binary_fixed_size!(EthSyncStatus);
-
 /// Current sync status
 pub trait SyncProvider: Send + Sync {
 	/// Get sync status
@@ -101,7 +98,6 @@ pub trait SyncProvider: Send + Sync {
 
 /// Transaction stats
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct TransactionStats {
 	/// Block number where this TX was first seen.
 	pub first_seen: u64,
@@ -111,7 +107,6 @@ pub struct TransactionStats {
 
 /// Peer connection information
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct PeerInfo {
 	/// Public node id
 	pub id: Option<String>,
@@ -131,7 +126,6 @@ pub struct PeerInfo {
 
 /// Ethereum protocol info.
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct EthProtocolInfo {
 	/// Protocol version
 	pub version: u32,
@@ -143,7 +137,6 @@ pub struct EthProtocolInfo {
 
 /// PIP protocol info.
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct PipProtocolInfo {
 	/// Protocol version
 	pub version: u32,
@@ -165,7 +158,6 @@ impl From<light_net::Status> for PipProtocolInfo {
 
 /// Configuration to attach alternate protocol handlers.
 /// Only works when IPC is disabled.
-#[cfg(not(feature = "ipc"))]
 pub struct AttachedProtocol {
 	/// The protocol handler in question.
 	pub handler: Arc<NetworkProtocolHandler + Send + Sync>,
@@ -177,32 +169,11 @@ pub struct AttachedProtocol {
 	pub versions: &'static [u8],
 }
 
-/// Attached protocol: disabled in IPC mode.
-#[cfg(feature = "ipc")]
-#[cfg_attr(feature = "ipc", derive(Binary))]
-pub struct AttachedProtocol;
-
 impl AttachedProtocol {
-	#[cfg(feature = "ipc")]
-	fn register(&self, network: &NetworkService) {
-		let res = network.register_protocol(
-			self.handler.clone(),
-			self.protocol_id,
-			self.packet_count,
-			self.versions
-		);
-
-		if let Err(e) = res {
-			warn!(target: "sync","Error attaching protocol {:?}", protocol_id);
-		}
-	}
-
-	#[cfg(not(feature = "ipc"))]
 	fn register(&self, _network: &NetworkService) {}
 }
 
 /// EthSync initialization parameters.
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct Params {
 	/// Configuration.
 	pub config: SyncConfig,
@@ -236,7 +207,7 @@ pub struct EthSync {
 
 impl EthSync {
 	/// Creates and register protocol with the network service
-	pub fn new(params: Params) -> Result<Arc<EthSync>, NetworkError> {
+	pub fn new(params: Params, connection_filter: Option<Arc<ConnectionFilter>>) -> Result<Arc<EthSync>, Error> {
 		const MAX_LIGHTSERV_LOAD: f64 = 0.5;
 
 		let pruning_info = params.chain.pruning_info();
@@ -272,7 +243,7 @@ impl EthSync {
 		};
 
 		let chain_sync = ChainSync::new(params.config, &*params.chain);
-		let service = NetworkService::new(params.network_config.clone().into_basic()?)?;
+		let service = NetworkService::new(params.network_config.clone().into_basic()?, connection_filter)?;
 
 		let sync = Arc::new(EthSync {
 			network: service,
@@ -292,7 +263,6 @@ impl EthSync {
 	}
 }
 
-#[cfg_attr(feature = "ipc", ipc(client_ident="SyncClient"))]
 impl SyncProvider for EthSync {
 	/// Get sync status
 	fn status(&self) -> EthSyncStatus {
@@ -427,8 +397,8 @@ impl ChainNotify for EthSync {
 	}
 
 	fn start(&self) {
-		match self.network.start() {
-			Err(NetworkError::StdIo(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
+		match self.network.start().map_err(Into::into) {
+			Err(ErrorKind::Io(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
 			Err(err) => warn!("Error starting network: {}", err),
 			_ => {},
 		}
@@ -477,9 +447,6 @@ impl LightHandler for TxRelay {
 	}
 }
 
-impl IpcConfig for ManageNetwork { }
-impl IpcConfig for SyncProvider { }
-
 /// Trait for managing network
 pub trait ManageNetwork : Send + Sync {
 	/// Set to allow unreserved peers to connect
@@ -496,10 +463,11 @@ pub trait ManageNetwork : Send + Sync {
 	fn stop_network(&self);
 	/// Query the current configuration of the network
 	fn network_config(&self) -> NetworkConfiguration;
+	/// Get network context for protocol.
+	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext));
 }
 
 
-#[cfg_attr(feature = "ipc", ipc(client_ident="NetworkManagerClient"))]
 impl ManageNetwork for EthSync {
 	fn accept_unreserved_peers(&self) {
 		self.network.set_non_reserved_mode(NonReservedPeerMode::Accept);
@@ -537,34 +505,13 @@ impl ManageNetwork for EthSync {
 	fn network_config(&self) -> NetworkConfiguration {
 		NetworkConfiguration::from(self.network.config().clone())
 	}
-}
 
-/// IP fiter
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ipc", binary)]
-pub enum AllowIP {
-	/// Connect to any address
-	All,
-	/// Connect to private network only
-	Private,
-	/// Connect to public network only
-	Public,
-}
-
-impl AllowIP {
-	/// Attempt to parse the peer mode from a string.
-	pub fn parse(s: &str) -> Option<Self> {
-		match s {
-			"all" => Some(AllowIP::All),
-			"private" => Some(AllowIP::Private),
-			"public" => Some(AllowIP::Public),
-			_ => None,
-		}
+	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext)) {
+		self.network.with_context_eval(proto, f);
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "ipc", binary)]
 /// Network service configuration
 pub struct NetworkConfiguration {
 	/// Directory path to store general network configuration. None means nothing will be saved
@@ -598,7 +545,9 @@ pub struct NetworkConfiguration {
 	/// The non-reserved peer mode.
 	pub allow_non_reserved: bool,
 	/// IP Filtering
-	pub allow_ips: AllowIP,
+	pub ip_filter: IpFilter,
+	/// Client version string
+	pub client_version: String,
 }
 
 impl NetworkConfiguration {
@@ -629,12 +578,9 @@ impl NetworkConfiguration {
 			max_handshakes: self.max_pending_peers,
 			reserved_protocols: hash_map![WARP_SYNC_PROTOCOL_ID => self.snapshot_peers],
 			reserved_nodes: self.reserved_nodes,
-			allow_ips: match self.allow_ips {
-				AllowIP::All => NetworkAllowIP::All,
-				AllowIP::Private => NetworkAllowIP::Private,
-				AllowIP::Public => NetworkAllowIP::Public,
-			},
+			ip_filter: self.ip_filter,
 			non_reserved_mode: if self.allow_non_reserved { NonReservedPeerMode::Accept } else { NonReservedPeerMode::Deny },
+			client_version: self.client_version,
 		})
 	}
 }
@@ -656,19 +602,15 @@ impl From<BasicNetworkConfiguration> for NetworkConfiguration {
 			max_pending_peers: other.max_handshakes,
 			snapshot_peers: *other.reserved_protocols.get(&WARP_SYNC_PROTOCOL_ID).unwrap_or(&0),
 			reserved_nodes: other.reserved_nodes,
-			allow_ips: match other.allow_ips {
-				NetworkAllowIP::All => AllowIP::All,
-				NetworkAllowIP::Private => AllowIP::Private,
-				NetworkAllowIP::Public => AllowIP::Public,
-			},
+			ip_filter: other.ip_filter,
 			allow_non_reserved: match other.non_reserved_mode { NonReservedPeerMode::Accept => true, _ => false } ,
+			client_version: other.client_version,
 		}
 	}
 }
 
 /// Configuration for IPC service.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct ServiceConfiguration {
 	/// Sync config.
 	pub sync: SyncConfig,
@@ -680,7 +622,6 @@ pub struct ServiceConfiguration {
 
 /// Numbers of peers (max, min, active).
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct PeerNumbers {
 	/// Number of connected peers.
 	pub connected: usize,
@@ -738,7 +679,7 @@ pub struct LightSync {
 
 impl LightSync {
 	/// Create a new light sync service.
-	pub fn new<L>(params: LightSyncParams<L>) -> Result<Self, NetworkError>
+	pub fn new<L>(params: LightSyncParams<L>) -> Result<Self, Error>
 		where L: AsLightClient + Provider + Sync + Send + 'static
 	{
 		use light_sync::LightSync as SyncHandler;
@@ -768,7 +709,7 @@ impl LightSync {
 			(sync_handler, Arc::new(light_proto))
 		};
 
-		let service = NetworkService::new(params.network_config)?;
+		let service = NetworkService::new(params.network_config, None)?;
 
 		Ok(LightSync {
 			proto: light_proto,
@@ -815,8 +756,10 @@ impl ManageNetwork for LightSync {
 	}
 
 	fn start_network(&self) {
-		match self.network.start() {
-			Err(NetworkError::StdIo(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
+		match self.network.start().map_err(Into::into) {
+			Err(ErrorKind::Io(ref e)) if e.kind() == io::ErrorKind::AddrInUse => {
+				warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set."))
+			}
 			Err(err) => warn!("Error starting network: {}", err),
 			_ => {},
 		}
@@ -838,6 +781,10 @@ impl ManageNetwork for LightSync {
 
 	fn network_config(&self) -> NetworkConfiguration {
 		NetworkConfiguration::from(self.network.config().clone())
+	}
+
+	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext)) {
+		self.network.with_context_eval(proto, f);
 	}
 }
 

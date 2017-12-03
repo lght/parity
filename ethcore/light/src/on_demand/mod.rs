@@ -27,7 +27,7 @@ use ethcore::executed::{Executed, ExecutionError};
 use futures::{Async, Poll, Future};
 use futures::sync::oneshot::{self, Sender, Receiver, Canceled};
 use network::PeerId;
-use util::{RwLock, Mutex};
+use parking_lot::{RwLock, Mutex};
 
 use net::{
 	self, Handler, PeerStatus, Status, Capabilities,
@@ -54,20 +54,28 @@ struct Peer {
 }
 
 impl Peer {
-	// whether this peer can fulfill the
-	fn can_fulfill(&self, c: &Capabilities) -> bool {
-		let caps = &self.capabilities;
+	// whether this peer can fulfill the necessary capabilities for the given
+	// request.
+	fn can_fulfill(&self, request: &Capabilities) -> bool {
+		let local_caps = &self.capabilities;
+		let can_serve_since = |req, local| {
+			match (req, local) {
+				(Some(request_block), Some(serve_since)) => request_block >= serve_since,
+				(Some(_), None) => false,
+				(None, _) => true,
+			}
+		};
 
-		caps.serve_headers == c.serve_headers &&
-			caps.serve_chain_since >= c.serve_chain_since &&
-			caps.serve_state_since >= c.serve_chain_since
+		local_caps.serve_headers >= request.serve_headers &&
+		    can_serve_since(request.serve_chain_since, local_caps.serve_chain_since) &&
+		    can_serve_since(request.serve_state_since, local_caps.serve_state_since)
 	}
 }
 
 // Attempted request info and sender to put received value.
 struct Pending {
-	requests: basic_request::Requests<CheckedRequest>,
-	net_requests: basic_request::Requests<NetworkRequest>,
+	requests: basic_request::Batch<CheckedRequest>,
+	net_requests: basic_request::Batch<NetworkRequest>,
 	required_capabilities: Capabilities,
 	responses: Vec<Response>,
 	sender: oneshot::Sender<Vec<Response>>,
@@ -143,7 +151,7 @@ impl Pending {
 	fn update_net_requests(&mut self) {
 		use request::IncompleteRequest;
 
-		let mut builder = basic_request::RequestBuilder::default();
+		let mut builder = basic_request::Builder::default();
 		let num_answered = self.requests.num_answered();
 		let mut mapping = move |idx| idx - num_answered;
 
@@ -186,6 +194,9 @@ fn guess_capabilities(requests: &[CheckedRequest]) -> Capabilities {
 			CheckedRequest::HeaderProof(_, _) =>
 				caps.serve_headers = true,
 			CheckedRequest::HeaderByHash(_, _) =>
+				caps.serve_headers = true,
+			CheckedRequest::TransactionIndex(_, _) => {} // hashes yield no info.
+			CheckedRequest::Signal(_, _) =>
 				caps.serve_headers = true,
 			CheckedRequest::Body(ref req, _) => if let Ok(ref hdr) = req.0.as_ref() {
 				update_since(&mut caps.serve_chain_since, hdr.number());
@@ -244,7 +255,7 @@ impl OnDemand {
 			peers: RwLock::new(HashMap::new()),
 			in_transit: RwLock::new(HashMap::new()),
 			cache: cache,
-			no_immediate_dispatch: true,
+			no_immediate_dispatch: false,
 		}
 	}
 
@@ -266,13 +277,12 @@ impl OnDemand {
 		-> Result<Receiver<Vec<Response>>, basic_request::NoSuchOutput>
 	{
 		let (sender, receiver) = oneshot::channel();
-
 		if requests.is_empty() {
 			assert!(sender.send(Vec::new()).is_ok(), "receiver still in scope; qed");
 			return Ok(receiver);
 		}
 
-		let mut builder = basic_request::RequestBuilder::default();
+		let mut builder = basic_request::Builder::default();
 
 		let responses = Vec::with_capacity(requests.len());
 
@@ -335,6 +345,7 @@ impl OnDemand {
 	// dispatch pending requests, and discard those for which the corresponding
 	// receiver has been dropped.
 	fn dispatch_pending(&self, ctx: &BasicContext) {
+
 		// wrapper future for calling `poll_cancel` on our `Senders` to preserve
 		// the invariant that it's always within a task.
 		struct CheckHangup<'a, T: 'a>(&'a mut Sender<T>);
@@ -360,6 +371,8 @@ impl OnDemand {
 		if self.pending.read().is_empty() { return }
 		let mut pending = self.pending.write();
 
+		debug!(target: "on_demand", "Attempting to dispatch {} pending requests", pending.len());
+
 		// iterate over all pending requests, and check them for hang-up.
 		// then, try and find a peer who can serve it.
 		let peers = self.peers.read();
@@ -378,16 +391,21 @@ impl OnDemand {
 
 					match ctx.request_from(*peer_id, pending.net_requests.clone()) {
 						Ok(req_id) => {
+							trace!(target: "on_demand", "Dispatched request {} to peer {}", req_id, peer_id);
 							self.in_transit.write().insert(req_id, pending);
 							return None
 						}
-						Err(net::Error::NoCredits) => {}
+						Err(net::Error::NoCredits) | Err(net::Error::NotServer) => {}
 						Err(e) => debug!(target: "on_demand", "Error dispatching request to peer: {}", e),
 					}
 				}
+
+				// TODO: maximum number of failures _when we have peers_.
 				Some(pending)
 			})
 			.collect(); // `pending` now contains all requests we couldn't dispatch.
+
+		debug!(target: "on_demand", "Was unable to dispatch {} requests.", pending.len());
 	}
 
 	// submit a pending request set. attempts to answer from cache before
@@ -395,6 +413,7 @@ impl OnDemand {
 	fn submit_pending(&self, ctx: &BasicContext, mut pending: Pending) {
 		// answer as many requests from cache as we can, and schedule for dispatch
 		// if incomplete.
+
 		pending.answer_from_cache(&*self.cache);
 		if let Some(mut pending) = pending.try_complete() {
 			pending.update_net_requests();

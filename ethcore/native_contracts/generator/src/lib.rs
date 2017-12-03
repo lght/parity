@@ -15,24 +15,23 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Rust code contract generator.
-//! The code generated will require a dependence on the `ethcore-util`,
+//! The code generated will require a dependence on the `ethcore-bigint::prelude`,
 //! `ethabi`, `byteorder`, and `futures` crates.
 //! This currently isn't hygienic, so compilation of generated code may fail
 //! due to missing crates or name collisions. This will change when
 //! it can be ported to a procedural macro.
 
-use ethabi::Contract;
-use ethabi::spec::{Interface, ParamType, Error as AbiError};
-use heck::SnakeCase;
-
 extern crate ethabi;
 extern crate heck;
+
+use ethabi::{Contract, ParamType};
+use heck::SnakeCase;
 
 /// Errors in generation.
 #[derive(Debug)]
 pub enum Error {
 	/// Bad ABI.
-	Abi(AbiError),
+	Abi(ethabi::Error),
 	/// Unsupported parameter type in given function.
 	UnsupportedType(String, ParamType),
 }
@@ -41,21 +40,23 @@ pub enum Error {
 /// a struct which can be used to call it.
 // TODO: make this a proc macro when that's possible.
 pub fn generate_module(struct_name: &str, abi: &str) -> Result<String, Error> {
-	let contract = Contract::new(Interface::load(abi.as_bytes()).map_err(Error::Abi)?);
+	let contract = Contract::load(abi.as_bytes()).map_err(Error::Abi)?;
 	let functions = generate_functions(&contract)?;
 
 	Ok(format!(r##"
 use byteorder::{{BigEndian, ByteOrder}};
-use futures::{{future, Future, IntoFuture, BoxFuture}};
-use ethabi::{{Contract, Interface, Token, Event}};
-use util;
+use futures::{{future, Future, IntoFuture}};
+use ethabi::{{Contract, Token, Event}};
+use bigint;
+
+type BoxFuture<A, B> = Box<Future<Item = A, Error = B> + Send>;
 
 /// Generated Rust bindings to an Ethereum contract.
 #[derive(Clone, Debug)]
 pub struct {name} {{
 	contract: Contract,
 	/// Address to make calls to.
-	pub address: util::Address,
+	pub address: bigint::prelude::H160,
 }}
 
 const ABI: &'static str = r#"{abi_str}"#;
@@ -63,9 +64,9 @@ const ABI: &'static str = r#"{abi_str}"#;
 impl {name} {{
 	/// Create a new instance of `{name}` with an address.
 	/// Calls can be made, given a callback for dispatching calls asynchronously.
-	pub fn new(address: util::Address) -> Self {{
-		let contract = Contract::new(Interface::load(ABI.as_bytes())
-			.expect("ABI checked at generation-time; qed"));
+	pub fn new(address: bigint::prelude::H160) -> Self {{
+		let contract = Contract::load(ABI.as_bytes())
+			.expect("ABI checked at generation-time; qed");
 		{name} {{
 			contract: contract,
 			address: address,
@@ -90,16 +91,16 @@ impl {name} {{
 fn generate_functions(contract: &Contract) -> Result<String, Error> {
 	let mut functions = String::new();
 	for function in contract.functions() {
-		let name = function.name();
+		let name = &function.name;
 		let snake_name = name.to_snake_case();
-		let inputs = function.input_params();
-		let outputs = function.output_params();
+		let inputs: Vec<_> = function.inputs.iter().map(|i| i.kind.clone()).collect();
+		let outputs: Vec<_> = function.outputs.iter().map(|i| i.kind.clone()).collect();
 
 		let (input_params, to_tokens) = input_params_codegen(&inputs)
-			.map_err(|bad_type| Error::UnsupportedType(name.into(), bad_type))?;
+			.map_err(|bad_type| Error::UnsupportedType(name.clone(), bad_type))?;
 
 		let (output_type, decode_outputs) = output_params_codegen(&outputs)
-			.map_err(|bad_type| Error::UnsupportedType(name.into(), bad_type))?;
+			.map_err(|bad_type| Error::UnsupportedType(name.clone(), bad_type))?;
 
 		functions.push_str(&format!(r##"
 /// Call the function "{abi_name}" on the contract.
@@ -108,25 +109,24 @@ fn generate_functions(contract: &Contract) -> Result<String, Error> {
 /// Outputs: {abi_outputs:?}
 pub fn {snake_name}<F, U>(&self, call: F, {params}) -> BoxFuture<{output_type}, String>
 	where
-	    F: FnOnce(util::Address, Vec<u8>) -> U,
+	    F: FnOnce(bigint::prelude::H160, Vec<u8>) -> U,
 	    U: IntoFuture<Item=Vec<u8>, Error=String>,
 		U::Future: Send + 'static
 {{
 	let function = self.contract.function(r#"{abi_name}"#)
-		.expect("function existence checked at compile-time; qed");
+		.expect("function existence checked at compile-time; qed").clone();
 	let call_addr = self.address;
 
-	let call_future = match function.encode_call({to_tokens}) {{
+	let call_future = match function.encode_input(&{to_tokens}) {{
 		Ok(call_data) => (call)(call_addr, call_data),
-		Err(e) => return future::err(format!("Error encoding call: {{:?}}", e)).boxed(),
+		Err(e) => return Box::new(future::err(format!("Error encoding call: {{:?}}", e))),
 	}};
 
-	call_future
+	Box::new(call_future
 		.into_future()
-		.and_then(move |out| function.decode_output(out).map_err(|e| format!("{{:?}}", e)))
+		.and_then(move |out| function.decode_output(&out).map_err(|e| format!("{{:?}}", e)))
 		.map(Vec::into_iter)
-		.and_then(|mut outputs| {decode_outputs})
-		.boxed()
+		.and_then(|mut outputs| {decode_outputs}))
 }}
 	"##,
 		abi_name = name,
@@ -217,8 +217,8 @@ fn output_params_codegen(outputs: &[ParamType]) -> Result<(String, String), Para
 // create code for an argument type from param type.
 fn rust_type(input: ParamType) -> Result<String, ParamType> {
 	Ok(match input {
-		ParamType::Address => "util::Address".into(),
-		ParamType::FixedBytes(len) if len <= 32 => format!("util::H{}", len * 8),
+		ParamType::Address => "bigint::prelude::H160".into(),
+		ParamType::FixedBytes(len) if len <= 32 => format!("bigint::prelude::H{}", len * 8),
 		ParamType::Bytes | ParamType::FixedBytes(_) => "Vec<u8>".into(),
 		ParamType::Int(width) => match width {
 			8 | 16 | 32 | 64 => format!("i{}", width),
@@ -226,7 +226,7 @@ fn rust_type(input: ParamType) -> Result<String, ParamType> {
 		},
 		ParamType::Uint(width) => match width {
 			8 | 16 | 32 | 64 => format!("u{}", width),
-			128 | 160 | 256 => format!("util::U{}", width),
+			128 | 160 | 256 => format!("bigint::prelude::U{}", width),
 			_ => return Err(ParamType::Uint(width)),
 		},
 		ParamType::Bool => "bool".into(),
@@ -259,8 +259,8 @@ fn tokenize(name: &str, input: ParamType) -> (bool, String) {
 		},
 		ParamType::Uint(width) => format!(
 			"let mut r = [0; 32]; {}.to_big_endian(&mut r); Token::Uint(r)",
-			if width <= 64 { format!("util::U256::from({} as u64)", name) }
-			else { format!("util::U256::from({})", name) }
+			if width <= 64 { format!("bigint::prelude::U256::from({} as u64)", name) }
+			else { format!("bigint::prelude::U256::from({})", name) }
 		),
 		ParamType::Bool => format!("Token::Bool({})", name),
 		ParamType::String => format!("Token::String({})", name),
@@ -281,11 +281,11 @@ fn tokenize(name: &str, input: ParamType) -> (bool, String) {
 // panics on unsupported types.
 fn detokenize(name: &str, output_type: ParamType) -> String {
 	match output_type {
-		ParamType::Address => format!("{}.to_address().map(util::H160)", name),
+		ParamType::Address => format!("{}.to_address().map(bigint::prelude::H160)", name),
 		ParamType::Bytes => format!("{}.to_bytes()", name),
 		ParamType::FixedBytes(len) if len <= 32 => {
 			// ensure no panic on slice too small.
-			let read_hash = format!("b.resize({}, 0); util::H{}::from_slice(&b[..{}])",
+			let read_hash = format!("b.resize({}, 0); bigint::prelude::H{}::from_slice(&b[..{}])",
 				len, len * 8, len);
 
 			format!("{}.to_fixed_bytes().map(|mut b| {{ {} }})",
@@ -302,8 +302,9 @@ fn detokenize(name: &str, output_type: ParamType) -> String {
 		}
 		ParamType::Uint(width) => {
 			let read_uint = match width {
-				8 | 16 | 32 | 64 => format!("util::U256(u).low_u64() as u{}", width),
-				_ => format!("util::U{}::from(&u[..])", width),
+				8 => "u[31] as u8".into(),
+				16 | 32 | 64 => format!("BigEndian::read_u{}(&u[{}..])", width, 32 - (width / 8)),
+				_ => format!("bigint::prelude::U{}::from(&u[..])", width),
 			};
 
 			format!("{}.to_uint().map(|u| {})", name, read_uint)
@@ -323,35 +324,35 @@ fn detokenize(name: &str, output_type: ParamType) -> String {
 
 #[cfg(test)]
 mod tests {
-	use ethabi::spec::ParamType;
+	use ethabi::ParamType;
 
 	#[test]
 	fn input_types() {
 		assert_eq!(::input_params_codegen(&[]).unwrap().0, "");
-		assert_eq!(::input_params_codegen(&[ParamType::Address]).unwrap().0, "param_0: util::Address, ");
+		assert_eq!(::input_params_codegen(&[ParamType::Address]).unwrap().0, "param_0: bigint::prelude::H160, ");
 		assert_eq!(::input_params_codegen(&[ParamType::Address, ParamType::Bytes]).unwrap().0,
-			"param_0: util::Address, param_1: Vec<u8>, ");
+			"param_0: bigint::prelude::H160, param_1: Vec<u8>, ");
 	}
 
 	#[test]
 	fn output_types() {
 		assert_eq!(::output_params_codegen(&[]).unwrap().0, "()");
-		assert_eq!(::output_params_codegen(&[ParamType::Address]).unwrap().0, "(util::Address)");
+		assert_eq!(::output_params_codegen(&[ParamType::Address]).unwrap().0, "(bigint::prelude::H160)");
 		assert_eq!(::output_params_codegen(&[ParamType::Address, ParamType::Array(Box::new(ParamType::Bytes))]).unwrap().0,
-			"(util::Address, Vec<Vec<u8>>)");
+			"(bigint::prelude::H160, Vec<Vec<u8>>)");
 	}
 
 	#[test]
 	fn rust_type() {
-		assert_eq!(::rust_type(ParamType::FixedBytes(32)).unwrap(), "util::H256");
+		assert_eq!(::rust_type(ParamType::FixedBytes(32)).unwrap(), "bigint::prelude::H256");
 		assert_eq!(::rust_type(ParamType::Array(Box::new(ParamType::FixedBytes(32)))).unwrap(),
-			"Vec<util::H256>");
+			"Vec<bigint::prelude::H256>");
 
 		assert_eq!(::rust_type(ParamType::Uint(64)).unwrap(), "u64");
 		assert!(::rust_type(ParamType::Uint(63)).is_err());
 
 		assert_eq!(::rust_type(ParamType::Int(32)).unwrap(), "i32");
-		assert_eq!(::rust_type(ParamType::Uint(256)).unwrap(), "util::U256");
+		assert_eq!(::rust_type(ParamType::Uint(256)).unwrap(), "bigint::prelude::U256");
 	}
 
 	// codegen tests will need bootstrapping of some kind.

@@ -20,49 +20,57 @@
 #![cfg_attr(feature="dev", feature(plugin))]
 #![cfg_attr(feature="dev", plugin(clippy))]
 
+#[macro_use]
+extern crate futures;
+
+extern crate ansi_term;
 extern crate cid;
 extern crate crypto as rust_crypto;
-extern crate futures;
 extern crate futures_cpupool;
+extern crate itertools;
 extern crate multihash;
 extern crate order_stat;
+extern crate parking_lot;
 extern crate rand;
 extern crate rustc_hex;
 extern crate semver;
 extern crate serde;
 extern crate serde_json;
 extern crate time;
+extern crate tiny_keccak;
 extern crate tokio_timer;
 extern crate transient_hashmap;
 
 extern crate jsonrpc_core;
 extern crate jsonrpc_http_server as http;
 extern crate jsonrpc_ipc_server as ipc;
-extern crate jsonrpc_minihttp_server as minihttp;
 extern crate jsonrpc_pubsub;
 
 extern crate ethash;
 extern crate ethcore;
+extern crate ethcore_bigint as bigint;
+extern crate ethcore_bytes as bytes;
 extern crate ethcore_devtools as devtools;
 extern crate ethcore_io as io;
-extern crate ethcore_ipc;
 extern crate ethcore_light as light;
+extern crate ethcore_util as util;
 extern crate ethcrypto as crypto;
 extern crate ethkey;
 extern crate ethstore;
 extern crate ethsync;
 extern crate ethcore_logger;
-extern crate evm;
+extern crate vm;
 extern crate fetch;
+extern crate node_health;
 extern crate parity_reactor;
 extern crate parity_updater as updater;
 extern crate rlp;
 extern crate stats;
+extern crate keccak_hash as hash;
+extern crate hardware_wallet;
 
 #[macro_use]
 extern crate log;
-#[cfg_attr(test, macro_use)]
-extern crate ethcore_util as util;
 #[macro_use]
 extern crate jsonrpc_macros;
 #[macro_use]
@@ -74,6 +82,13 @@ extern crate ethjson;
 #[cfg(test)]
 #[macro_use]
 extern crate pretty_assertions;
+
+#[cfg(test)]
+#[macro_use]
+extern crate macros;
+
+#[cfg(test)]
+extern crate kvdb_memorydb;
 
 pub extern crate jsonrpc_ws_server as ws;
 
@@ -101,58 +116,7 @@ use std::net::SocketAddr;
 use http::tokio_core;
 
 /// RPC HTTP Server instance
-pub enum HttpServer {
-	/// Fast MiniHTTP variant
-	Mini(minihttp::Server),
-	/// Hyper variant
-	Hyper(http::Server),
-}
-
-impl HttpServer {
-	/// Returns current listening address.
-	pub fn address(&self) -> &SocketAddr {
-		match *self {
-			HttpServer::Mini(ref s) => s.address(),
-			HttpServer::Hyper(ref s) => &s.addrs()[0],
-		}
-	}
-}
-
-/// RPC HTTP Server error
-#[derive(Debug)]
-pub enum HttpServerError {
-	/// IO error
-	Io(::std::io::Error),
-	/// Other hyper error
-	Hyper(hyper::Error),
-}
-
-impl From<http::Error> for HttpServerError {
-	fn from(e: http::Error) -> Self {
-		use self::HttpServerError::*;
-		match e {
-			http::Error::Io(io) => Io(io),
-			http::Error::Other(hyper) => Hyper(hyper),
-		}
-	}
-}
-
-impl From<minihttp::Error> for HttpServerError {
-	fn from(e: minihttp::Error) -> Self {
-		use self::HttpServerError::*;
-		match e {
-			minihttp::Error::Io(io) => Io(io),
-		}
-	}
-}
-
-/// HTTP server implementation-specific settings.
-pub enum HttpSettings<R: RequestMiddleware> {
-	/// Enable fast minihttp server with given number of threads.
-	Threads(usize),
-	/// Enable standard server with optional dapps middleware.
-	Dapps(Option<R>),
-}
+pub type HttpServer = http::Server;
 
 /// Start http server asynchronously and returns result with `Server` handle on success or an error.
 pub fn start_http<M, S, H, T, R>(
@@ -162,38 +126,27 @@ pub fn start_http<M, S, H, T, R>(
 	handler: H,
 	remote: tokio_core::reactor::Remote,
 	extractor: T,
-	settings: HttpSettings<R>,
-) -> Result<HttpServer, HttpServerError> where
+	middleware: Option<R>,
+	threads: usize,
+) -> ::std::io::Result<HttpServer> where
 	M: jsonrpc_core::Metadata,
 	S: jsonrpc_core::Middleware<M>,
 	H: Into<jsonrpc_core::MetaIoHandler<M, S>>,
 	T: HttpMetaExtractor<Metadata=M>,
 	R: RequestMiddleware,
 {
-	Ok(match settings {
-		HttpSettings::Dapps(middleware) => {
-			let mut builder = http::ServerBuilder::new(handler)
-				.event_loop_remote(remote)
-				.meta_extractor(http_common::HyperMetaExtractor::new(extractor))
-				.cors(cors_domains.into())
-				.allowed_hosts(allowed_hosts.into());
+	let mut builder = http::ServerBuilder::new(handler)
+		.threads(threads)
+		.event_loop_remote(remote)
+		.meta_extractor(http_common::MetaExtractor::new(extractor))
+		.cors(cors_domains.into())
+		.allowed_hosts(allowed_hosts.into());
 
-			if let Some(dapps) = middleware {
-				builder = builder.request_middleware(dapps)
-			}
-			builder.start_http(addr)
-				.map(HttpServer::Hyper)?
-		},
-		HttpSettings::Threads(threads) => {
-			minihttp::ServerBuilder::new(handler)
-				.threads(threads)
-				.meta_extractor(http_common::MiniMetaExtractor::new(extractor))
-				.cors(cors_domains.into())
-				.allowed_hosts(allowed_hosts.into())
-				.start_http(addr)
-				.map(HttpServer::Mini)?
-		},
-	})
+	if let Some(dapps) = middleware {
+		builder = builder.request_middleware(dapps)
+	}
+
+	Ok(builder.start_http(addr)?)
 }
 
 /// Start ipc server asynchronously and returns result with `Server` handle on success or an error.

@@ -28,7 +28,9 @@ use std::collections::hash_map::Entry;
 
 use ethcore::error::{TransactionError, TransactionImportResult};
 use ethcore::transaction::{Condition, PendingTransaction, SignedTransaction};
-use util::{Address, U256, H256, H256FastMap};
+use bigint::prelude::U256;
+use bigint::hash::{H256, H256FastMap};
+use util::Address;
 
 // Knowledge of an account's current nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +320,11 @@ impl TransactionQueue {
 		for hash in removed_hashes {
 			self.by_hash.remove(&hash);
 		}
+	}
+
+	/// Get a transaction by hash.
+	pub fn get(&self, hash: &H256) -> Option<&PendingTransaction> {
+		self.by_hash.get(&hash)
 	}
 }
 

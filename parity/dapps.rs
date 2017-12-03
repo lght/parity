@@ -21,25 +21,25 @@ use dir::default_data_path;
 use ethcore::client::{Client, BlockChainClient, BlockId};
 use ethcore::transaction::{Transaction, Action};
 use ethsync::LightSync;
-use futures::{future, IntoFuture, Future, BoxFuture};
-use futures_cpupool::CpuPool;
+use futures::{future, IntoFuture, Future};
 use hash_fetch::fetch::Client as FetchClient;
 use hash_fetch::urlhint::ContractClient;
 use helpers::replace_home;
-use light::client::Client as LightClient;
+use light::client::LightChainClient;
 use light::on_demand::{self, OnDemand};
+use node_health::{SyncStatus, NodeHealth};
 use rpc;
 use rpc_apis::SignerService;
-use parity_reactor;
-use util::{Bytes, Address};
+use util::Address;
+use bytes::Bytes;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Configuration {
 	pub enabled: bool,
-	pub ntp_server: String,
 	pub dapps_path: PathBuf,
 	pub extra_dapps: Vec<PathBuf>,
 	pub extra_embed_on: Vec<(String, u16)>,
+	pub extra_script_src: Vec<(String, u16)>,
 }
 
 impl Default for Configuration {
@@ -47,16 +47,16 @@ impl Default for Configuration {
 		let data_dir = default_data_path();
 		Configuration {
 			enabled: true,
-			ntp_server: "pool.ntp.org:123".into(),
 			dapps_path: replace_home(&data_dir, "$BASE/dapps").into(),
 			extra_dapps: vec![],
 			extra_embed_on: vec![],
+			extra_script_src: vec![],
 		}
 	}
 }
 
 impl Configuration {
-	pub fn address(&self, address: Option<(String, u16)>) -> Option<(String, u16)> {
+	pub fn address(&self, address: Option<::parity_rpc::Host>) -> Option<::parity_rpc::Host> {
 		match self.enabled {
 			true => address,
 			false => None,
@@ -79,24 +79,23 @@ impl ContractClient for FullRegistrar {
 			 })
 	}
 
-	fn call(&self, address: Address, data: Bytes) -> BoxFuture<Bytes, String> {
-		self.client.call_contract(BlockId::Latest, address, data)
-			.into_future()
-			.boxed()
+	fn call(&self, address: Address, data: Bytes) -> Box<Future<Item=Bytes, Error=String> + Send> {
+		Box::new(self.client.call_contract(BlockId::Latest, address, data)
+			.into_future())
 	}
 }
 
 /// Registrar implementation for the light client.
-pub struct LightRegistrar {
+pub struct LightRegistrar<T> {
 	/// The light client.
-	pub client: Arc<LightClient>,
+	pub client: Arc<T>,
 	/// Handle to the on-demand service.
 	pub on_demand: Arc<OnDemand>,
 	/// Handle to the light network service.
 	pub sync: Arc<LightSync>,
 }
 
-impl ContractClient for LightRegistrar {
+impl<T: LightChainClient + 'static> ContractClient for LightRegistrar<T> {
 	fn registrar(&self) -> Result<Address, String> {
 		self.client.engine().additional_params().get("registrar")
 			 .ok_or_else(|| "Registrar not defined.".into())
@@ -105,8 +104,15 @@ impl ContractClient for LightRegistrar {
 			 })
 	}
 
-	fn call(&self, address: Address, data: Bytes) -> BoxFuture<Bytes, String> {
-		let (header, env_info) = (self.client.best_block_header(), self.client.latest_env_info());
+	fn call(&self, address: Address, data: Bytes) -> Box<Future<Item=Bytes, Error=String> + Send> {
+		let header = self.client.best_block_header();
+		let env_info = self.client.env_info(BlockId::Hash(header.hash()))
+			.ok_or_else(|| format!("Cannot fetch env info for header {}", header.hash()));
+
+		let env_info = match env_info {
+			Ok(x) => x,
+			Err(e) => return Box::new(future::err(e)),
+		};
 
 		let maybe_future = self.sync.with_context(move |ctx| {
 			self.on_demand
@@ -114,7 +120,7 @@ impl ContractClient for LightRegistrar {
 					tx: Transaction {
 						nonce: self.client.engine().account_start_nonce(header.number()),
 						action: Action::Call(address),
-						gas: 50_000_000.into(),
+						gas: 50_000.into(), // should be enough for all registry lookups. TODO: exponential backoff
 						gas_price: 0.into(),
 						value: 0.into(),
 						data: data,
@@ -132,8 +138,8 @@ impl ContractClient for LightRegistrar {
 		});
 
 		match maybe_future {
-			Some(fut) => fut.boxed(),
-			None => future::err("cannot query registry: network disabled".into()).boxed(),
+			Some(fut) => Box::new(fut),
+			None => Box::new(future::err("cannot query registry: network disabled".into())),
 		}
 	}
 }
@@ -142,10 +148,9 @@ impl ContractClient for LightRegistrar {
 // to resolve.
 #[derive(Clone)]
 pub struct Dependencies {
+	pub node_health: NodeHealth,
 	pub sync_status: Arc<SyncStatus>,
 	pub contract_client: Arc<ContractClient>,
-	pub remote: parity_reactor::TokioRemote,
-	pub pool: CpuPool,
 	pub fetch: FetchClient,
 	pub signer: Arc<SignerService>,
 	pub ui_address: Option<(String, u16)>,
@@ -158,27 +163,26 @@ pub fn new(configuration: Configuration, deps: Dependencies) -> Result<Option<Mi
 
 	server::dapps_middleware(
 		deps,
-		&configuration.ntp_server,
 		configuration.dapps_path,
 		configuration.extra_dapps,
 		rpc::DAPPS_DOMAIN,
 		configuration.extra_embed_on,
+		configuration.extra_script_src,
 	).map(Some)
 }
 
-pub fn new_ui(enabled: bool, ntp_server: &str, deps: Dependencies) -> Result<Option<Middleware>, String> {
+pub fn new_ui(enabled: bool, deps: Dependencies) -> Result<Option<Middleware>, String> {
 	if !enabled {
 		return Ok(None);
 	}
 
 	server::ui_middleware(
 		deps,
-		ntp_server,
 		rpc::DAPPS_DOMAIN,
 	).map(Some)
 }
 
-pub use self::server::{SyncStatus, Middleware, service};
+pub use self::server::{Middleware, service};
 
 #[cfg(not(feature = "dapps"))]
 mod server {
@@ -188,34 +192,26 @@ mod server {
 	use parity_rpc::{hyper, RequestMiddleware, RequestMiddlewareAction};
 	use rpc_apis;
 
-	pub trait SyncStatus {
-		fn is_major_importing(&self) -> bool;
-		fn peers(&self) -> (usize, usize);
-	}
-
 	pub struct Middleware;
 	impl RequestMiddleware for Middleware {
-		fn on_request(
-			&self, _req: &hyper::server::Request<hyper::net::HttpStream>, _control: &hyper::Control
-		) -> RequestMiddlewareAction {
+		fn on_request(&self, _req: hyper::Request) -> RequestMiddlewareAction {
 			unreachable!()
 		}
 	}
 
 	pub fn dapps_middleware(
 		_deps: Dependencies,
-		_ntp_server: &str,
 		_dapps_path: PathBuf,
 		_extra_dapps: Vec<PathBuf>,
 		_dapps_domain: &str,
 		_extra_embed_on: Vec<(String, u16)>,
+		_extra_script_src: Vec<(String, u16)>,
 	) -> Result<Middleware, String> {
 		Err("Your Parity version has been compiled without WebApps support.".into())
 	}
 
 	pub fn ui_middleware(
 		_deps: Dependencies,
-		_ntp_server: &str,
 		_dapps_domain: &str,
 	) -> Result<Middleware, String> {
 		Err("Your Parity version has been compiled without UI support.".into())
@@ -234,29 +230,26 @@ mod server {
 	use rpc_apis;
 
 	use parity_dapps;
-	use parity_reactor;
 
 	pub use parity_dapps::Middleware;
-	pub use parity_dapps::SyncStatus;
 
 	pub fn dapps_middleware(
 		deps: Dependencies,
-		ntp_server: &str,
 		dapps_path: PathBuf,
 		extra_dapps: Vec<PathBuf>,
 		dapps_domain: &str,
 		extra_embed_on: Vec<(String, u16)>,
+		extra_script_src: Vec<(String, u16)>,
 	) -> Result<Middleware, String> {
 		let signer = deps.signer;
-		let parity_remote = parity_reactor::Remote::new(deps.remote.clone());
 		let web_proxy_tokens = Arc::new(move |token| signer.web_proxy_access_token_domain(&token));
 
 		Ok(parity_dapps::Middleware::dapps(
-			ntp_server,
-			deps.pool,
-			parity_remote,
+			deps.fetch.pool(),
+			deps.node_health,
 			deps.ui_address,
 			extra_embed_on,
+			extra_script_src,
 			dapps_path,
 			extra_dapps,
 			dapps_domain,
@@ -269,14 +262,11 @@ mod server {
 
 	pub fn ui_middleware(
 		deps: Dependencies,
-		ntp_server: &str,
 		dapps_domain: &str,
 	) -> Result<Middleware, String> {
-		let parity_remote = parity_reactor::Remote::new(deps.remote.clone());
 		Ok(parity_dapps::Middleware::ui(
-			ntp_server,
-			deps.pool,
-			parity_remote,
+			deps.fetch.pool(),
+			deps.node_health,
 			dapps_domain,
 			deps.contract_client,
 			deps.sync_status,
@@ -286,7 +276,7 @@ mod server {
 
 	pub fn service(middleware: &Option<Middleware>) -> Option<Arc<rpc_apis::DappsService>> {
 		middleware.as_ref().map(|m| Arc::new(DappsServiceWrapper {
-			endpoints: m.endpoints()
+			endpoints: m.endpoints().clone(),
 		}) as Arc<rpc_apis::DappsService>)
 	}
 
@@ -305,8 +295,14 @@ mod server {
 					version: app.version,
 					author: app.author,
 					icon_url: app.icon_url,
+					local_url: app.local_url,
 				})
 				.collect()
+		}
+
+		fn refresh_local_dapps(&self) -> bool {
+			self.endpoints.refresh_local_dapps();
+			true
 		}
 	}
 }

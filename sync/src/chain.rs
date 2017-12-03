@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-///
 /// `BlockChain` synchronization strategy.
 /// Syncs to peers and keeps up to date.
 /// This implementation uses ethereum protocol v63
@@ -89,9 +88,16 @@
 /// All other messages are ignored.
 ///
 
-use util::*;
+use std::collections::{HashSet, HashMap};
+use std::cmp;
+use hash::keccak;
+use heapsize::HeapSizeOf;
+use bigint::prelude::U256;
+use bigint::hash::{H256, H256FastMap};
+use parking_lot::RwLock;
+use bytes::Bytes;
 use rlp::*;
-use network::*;
+use network::{self, PeerId, PacketId};
 use ethcore::header::{BlockNumber, Header as BlockHeader};
 use ethcore::client::{BlockChainClient, BlockStatus, BlockId, BlockChainInfo, BlockImportError, BlockQueueInfo};
 use ethcore::error::*;
@@ -123,7 +129,6 @@ const MIN_PEERS_PROPAGATION: usize = 4;
 const MAX_PEERS_PROPAGATION: usize = 128;
 const MAX_PEER_LAG_PROPAGATION: BlockNumber = 20;
 const MAX_NEW_HASHES: usize = 64;
-const MAX_TX_TO_IMPORT: usize = 512;
 const MAX_NEW_BLOCK_AGE: BlockNumber = 20;
 const MAX_TRANSACTION_SIZE: usize = 300*1024;
 // maximal packet size with transactions (cannot be greater than 16MB - protocol limitation).
@@ -131,7 +136,7 @@ const MAX_TRANSACTION_PACKET_SIZE: usize = 8 * 1024 * 1024;
 // Maximal number of transactions in sent in single packet.
 const MAX_TRANSACTIONS_TO_PROPAGATE: usize = 64;
 // Min number of blocks to be behind for a snapshot sync
-const SNAPSHOT_RESTORE_THRESHOLD: BlockNumber = 100000;
+const SNAPSHOT_RESTORE_THRESHOLD: BlockNumber = 30000;
 const SNAPSHOT_MIN_PEERS: usize = 3;
 
 const STATUS_PACKET: u8 = 0x00;
@@ -163,7 +168,7 @@ const MAX_SNAPSHOT_CHUNKS_DOWNLOAD_AHEAD: usize = 3;
 const WAIT_PEERS_TIMEOUT_SEC: u64 = 5;
 const STATUS_TIMEOUT_SEC: u64 = 5;
 const HEADERS_TIMEOUT_SEC: u64 = 15;
-const BODIES_TIMEOUT_SEC: u64 = 10;
+const BODIES_TIMEOUT_SEC: u64 = 20;
 const RECEIPTS_TIMEOUT_SEC: u64 = 10;
 const FORK_HEADER_TIMEOUT_SEC: u64 = 3;
 const SNAPSHOT_MANIFEST_TIMEOUT_SEC: u64 = 5;
@@ -421,7 +426,7 @@ impl ChainSync {
 			start_block_number: self.starting_block,
 			last_imported_block_number: Some(last_imported_number),
 			last_imported_old_block_number: self.old_blocks.as_ref().map(|d| d.last_imported_block_number()),
-			highest_block_number: self.highest_block.map(|n| max(n, last_imported_number)),
+			highest_block_number: self.highest_block.map(|n| cmp::max(n, last_imported_number)),
 			blocks_received: if last_imported_number > self.starting_block { last_imported_number - self.starting_block } else { 0 },
 			blocks_total: match self.highest_block { Some(x) if x > self.starting_block => x - self.starting_block, _ => 0 },
 			num_peers: self.peers.values().filter(|p| p.is_allowed()).count(),
@@ -453,7 +458,7 @@ impl ChainSync {
 
 	/// Updates transactions were received by a peer
 	pub fn transactions_received(&mut self, hashes: Vec<H256>, peer_id: PeerId) {
-		if let Some(mut peer_info) = self.peers.get_mut(&peer_id) {
+		if let Some(peer_info) = self.peers.get_mut(&peer_id) {
 			peer_info.last_sent_transactions.extend(&hashes);
 		}
 	}
@@ -680,7 +685,7 @@ impl ChainSync {
 					peer.confirmation = ForkConfirmation::TooShort;
 				} else {
 					let header = r.at(0)?.as_raw();
-					if header.sha3() == fork_hash {
+					if keccak(&header) == fork_hash {
 						trace!(target: "sync", "{}: Confirmed peer", peer_id);
 						peer.confirmation = ForkConfirmation::Confirmed;
 						if !io.chain_overlay().read().contains_key(&fork_number) {
@@ -688,7 +693,7 @@ impl ChainSync {
 						}
 					} else {
 						trace!(target: "sync", "{}: Fork mismatch", peer_id);
-						io.disconnect_peer(peer_id);
+						io.disable_peer(peer_id);
 						return Ok(());
 					}
 				}
@@ -724,7 +729,7 @@ impl ChainSync {
 		}
 
 		let result =  {
-			let mut downloader = match block_set {
+			let downloader = match block_set {
 				BlockSet::NewBlocks => &mut self.new_blocks,
 				BlockSet::OldBlocks => {
 					match self.old_blocks {
@@ -789,7 +794,7 @@ impl ChainSync {
 		else
 		{
 			let result = {
-				let mut downloader = match block_set {
+				let downloader = match block_set {
 					BlockSet::NewBlocks => &mut self.new_blocks,
 					BlockSet::OldBlocks => match self.old_blocks {
 						None => {
@@ -843,7 +848,7 @@ impl ChainSync {
 		else
 		{
 			let result = {
-				let mut downloader = match block_set {
+				let downloader = match block_set {
 					BlockSet::NewBlocks => &mut self.new_blocks,
 					BlockSet::OldBlocks => match self.old_blocks {
 						None => {
@@ -892,7 +897,7 @@ impl ChainSync {
 		}
 		let block_rlp = r.at(0)?;
 		let header_rlp = block_rlp.at(0)?;
-		let h = header_rlp.as_raw().sha3();
+		let h = keccak(&header_rlp.as_raw());
 		trace!(target: "sync", "{} -> NewBlock ({})", peer_id, h);
 		let header: BlockHeader = header_rlp.as_val()?;
 		if header.number() > self.highest_block.unwrap_or(0) {
@@ -961,7 +966,7 @@ impl ChainSync {
 		}
 		if self.state != SyncState::Idle {
 			trace!(target: "sync", "Ignoring new hashes since we're already downloading.");
-			let max = r.iter().take(MAX_NEW_HASHES).map(|item| item.val_at::<BlockNumber>(1).unwrap_or(0)).fold(0u64, max);
+			let max = r.iter().take(MAX_NEW_HASHES).map(|item| item.val_at::<BlockNumber>(1).unwrap_or(0)).fold(0u64, cmp::max);
 			if max > self.highest_block.unwrap_or(0) {
 				self.highest_block = Some(max);
 			}
@@ -993,7 +998,7 @@ impl ChainSync {
 				BlockStatus::Queued => {
 					trace!(target: "sync", "New hash block already queued {:?}", hash);
 				},
-				BlockStatus::Unknown => {
+				BlockStatus::Unknown | BlockStatus::Pending => {
 					new_hashes.push(hash.clone());
 					if number > max_height {
 						trace!(target: "sync", "New unknown block hash {:?}", hash);
@@ -1053,7 +1058,7 @@ impl ChainSync {
 			self.continue_sync(io);
 			return Ok(());
 		}
-		self.snapshot.reset_to(&manifest, &manifest_rlp.as_raw().sha3());
+		self.snapshot.reset_to(&manifest, &keccak(manifest_rlp.as_raw()));
 		io.snapshot_service().begin_restore(manifest);
 		self.state = SyncState::SnapshotData;
 
@@ -1146,7 +1151,7 @@ impl ChainSync {
 		trace!(target: "sync", "== Connected {}: {}", peer, io.peer_info(peer));
 		if let Err(e) = self.send_status(io, peer) {
 			debug!(target:"sync", "Error sending status request: {:?}", e);
-			io.disable_peer(peer);
+			io.disconnect_peer(peer);
 		} else {
 			self.handshaking_peers.insert(peer, time::precise_time_ns());
 		}
@@ -1447,7 +1452,7 @@ impl ChainSync {
 			};
 			if let Err(e) = result {
 				debug!(target:"sync", "Error sending request: {:?}", e);
-				sync.disable_peer(peer_id);
+				sync.disconnect_peer(peer_id);
 			}
 		}
 	}
@@ -1456,7 +1461,7 @@ impl ChainSync {
 	fn send_packet(&mut self, sync: &mut SyncIo, peer_id: PeerId, packet_id: PacketId, packet: Bytes) {
 		if let Err(e) = sync.send(peer_id, packet_id, packet) {
 			debug!(target:"sync", "Error sending packet: {:?}", e);
-			sync.disable_peer(peer_id);
+			sync.disconnect_peer(peer_id);
 		}
 	}
 
@@ -1471,9 +1476,8 @@ impl ChainSync {
 			trace!(target: "sync", "{} Ignoring transactions from unconfirmed/unknown peer", peer_id);
 		}
 
-		let mut item_count = r.item_count()?;
+		let item_count = r.item_count()?;
 		trace!(target: "sync", "{:02} -> Transactions ({} entries)", peer_id, item_count);
-		item_count = min(item_count, MAX_TX_TO_IMPORT);
 		let mut transactions = Vec::with_capacity(item_count);
 		for i in 0 .. item_count {
 			let rlp = r.at(i)?;
@@ -1489,7 +1493,7 @@ impl ChainSync {
 	}
 
 	/// Send Status message
-	fn send_status(&mut self, io: &mut SyncIo, peer: PeerId) -> Result<(), NetworkError> {
+	fn send_status(&mut self, io: &mut SyncIo, peer: PeerId) -> Result<(), network::Error> {
 		let warp_protocol_version = io.protocol_version(&WARP_SYNC_PROTOCOL_ID, peer);
 		let warp_protocol = warp_protocol_version != 0;
 		let protocol = if warp_protocol { warp_protocol_version } else { PROTOCOL_VERSION_63 };
@@ -1507,7 +1511,7 @@ impl ChainSync {
 				false => io.snapshot_service().manifest(),
 			};
 			let block_number = manifest.as_ref().map_or(0, |m| m.block_number);
-			let manifest_hash = manifest.map_or(H256::new(), |m| m.into_rlp().sha3());
+			let manifest_hash = manifest.map_or(H256::new(), |m| keccak(m.into_rlp()));
 			packet.append(&manifest_hash);
 			packet.append(&block_number);
 		}
@@ -1529,7 +1533,7 @@ impl ChainSync {
 			match io.chain().block_header(BlockId::Hash(hash)) {
 				Some(hdr) => {
 					let number = hdr.number().into();
-					debug_assert_eq!(hdr.sha3(), hash);
+					debug_assert_eq!(hdr.hash(), hash);
 
 					if max_headers == 1 || io.chain().block_hash(BlockId::Number(number)) != Some(hash) {
 						// Non canonical header or single header requested
@@ -1549,11 +1553,11 @@ impl ChainSync {
 		};
 
 		let mut number = if reverse {
-			min(last, number)
+			cmp::min(last, number)
 		} else {
-			max(0, number)
+			cmp::max(0, number)
 		};
-		let max_count = min(MAX_HEADERS_TO_SEND, max_headers);
+		let max_count = cmp::min(MAX_HEADERS_TO_SEND, max_headers);
 		let mut count = 0;
 		let mut data = Bytes::new();
 		let inc = (skip + 1) as BlockNumber;
@@ -1594,7 +1598,7 @@ impl ChainSync {
 			debug!(target: "sync", "Empty GetBlockBodies request, ignoring.");
 			return Ok(None);
 		}
-		count = min(count, MAX_BODIES_TO_SEND);
+		count = cmp::min(count, MAX_BODIES_TO_SEND);
 		let mut added = 0usize;
 		let mut data = Bytes::new();
 		for i in 0..count {
@@ -1617,7 +1621,7 @@ impl ChainSync {
 			debug!(target: "sync", "Empty GetNodeData request, ignoring.");
 			return Ok(None);
 		}
-		count = min(count, MAX_NODE_DATA_TO_SEND);
+		count = cmp::min(count, MAX_NODE_DATA_TO_SEND);
 		let mut added = 0usize;
 		let mut data = Vec::new();
 		for i in 0..count {
@@ -1641,7 +1645,7 @@ impl ChainSync {
 			debug!(target: "sync", "Empty GetReceipts request, ignoring.");
 			return Ok(None);
 		}
-		count = min(count, MAX_RECEIPTS_HEADERS_TO_SEND);
+		count = cmp::min(count, MAX_RECEIPTS_HEADERS_TO_SEND);
 		let mut added_headers = 0usize;
 		let mut added_receipts = 0usize;
 		let mut data = Bytes::new();
@@ -1701,7 +1705,7 @@ impl ChainSync {
 
 	fn return_rlp<FRlp, FError>(io: &mut SyncIo, rlp: &UntrustedRlp, peer: PeerId, rlp_func: FRlp, error_func: FError) -> Result<(), PacketDecodeError>
 		where FRlp : Fn(&SyncIo, &UntrustedRlp, PeerId) -> RlpResponseResult,
-			FError : FnOnce(NetworkError) -> String
+			FError : FnOnce(network::Error) -> String
 	{
 		let response = rlp_func(io, rlp, peer);
 		match response {
@@ -1915,8 +1919,8 @@ impl ChainSync {
 		// take sqrt(x) peers
 		let mut peers = peers.to_vec();
 		let mut count = (peers.len() as f64).powf(0.5).round() as usize;
-		count = min(count, MAX_PEERS_PROPAGATION);
-		count = max(count, MIN_PEERS_PROPAGATION);
+		count = cmp::min(count, MAX_PEERS_PROPAGATION);
+		count = cmp::max(count, MIN_PEERS_PROPAGATION);
 		random::new().shuffle(&mut peers);
 		peers.truncate(count);
 		peers
@@ -2006,7 +2010,7 @@ impl ChainSync {
 	fn select_peers_for_transactions<F>(&self, filter: F) -> Vec<PeerId>
 		where F: Fn(&PeerId) -> bool {
 		// sqrt(x)/x scaled to max u32
-		let fraction = (self.peers.len() as f64).powf(-0.5).mul(u32::max_value() as f64).round() as u32;
+		let fraction = ((self.peers.len() as f64).powf(-0.5) * (u32::max_value() as f64).round()) as u32;
 		let small = self.peers.len() < MIN_PEERS_PROPAGATION;
 
 		let mut random = random::new();
@@ -2112,7 +2116,7 @@ impl ChainSync {
 				peers.insert(peer_id);
 				self.send_packet(io, peer_id, TRANSACTIONS_PACKET, rlp);
 				trace!(target: "sync", "{:02} <- Transactions ({} entries)", peer_id, sent);
-				max_sent = max(max_sent, sent);
+				max_sent = cmp::max(max_sent, sent);
 			}
 			debug!(target: "sync", "Sent up to {} transactions to {} peers.", max_sent, lucky_peers_len);
 		}
@@ -2180,7 +2184,7 @@ impl ChainSync {
 			// Select random peer to re-broadcast transactions to.
 			let peer = random::new().gen_range(0, self.peers.len());
 			trace!(target: "sync", "Re-broadcasting transactions to a random peer.");
-			self.peers.values_mut().nth(peer).map(|mut peer_info|
+			self.peers.values_mut().nth(peer).map(|peer_info|
 				peer_info.last_sent_transactions.clear()
 			);
 		}
@@ -2223,20 +2227,20 @@ fn accepts_service_transaction(client_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use std::collections::{HashSet, VecDeque};
+	use {ethkey, Address};
 	use network::PeerId;
 	use tests::helpers::*;
 	use tests::snapshot::TestSnapshotService;
-	use util::{U256, Address, RwLock};
-	use util::sha3::Hashable;
-	use util::hash::H256;
-	use util::bytes::Bytes;
+	use bigint::prelude::U256;
+	use bigint::hash::H256;
+	use parking_lot::RwLock;
+	use bytes::Bytes;
 	use rlp::{Rlp, RlpStream, UntrustedRlp};
 	use super::*;
 	use ::SyncConfig;
 	use super::{PeerInfo, PeerAsking};
-	use ethkey;
 	use ethcore::header::*;
-	use ethcore::client::*;
+	use ethcore::client::{BlockChainClient, EachBlockWith, TestBlockChainClient};
 	use ethcore::transaction::UnverifiedTransaction;
 	use ethcore::miner::MinerService;
 
@@ -2392,7 +2396,7 @@ mod tests {
 		let blocks: Vec<_> = (0 .. 100)
 			.map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).map(|b| b.into_inner()).unwrap()).collect();
 		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
-		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).hash()).collect();
 
 		let queue = RwLock::new(VecDeque::new());
 		let ss = TestSnapshotService::new();

@@ -20,10 +20,12 @@ use std::sync::Arc;
 use ethcore::account_provider::AccountProvider;
 use ethcore::transaction::PendingTransaction;
 
-use util::{Address, U128, ToPretty};
+use bigint::prelude::U128;
+use util::Address;
+use bytes::ToPretty;
 
-use futures::{future, Future, BoxFuture};
-use jsonrpc_core::Error;
+use jsonrpc_core::{BoxFuture, Result};
+use jsonrpc_core::futures::{future, Future};
 use v1::helpers::errors;
 use v1::helpers::dispatch::{Dispatcher, SignWith};
 use v1::helpers::accounts::unwrap_provider;
@@ -40,15 +42,15 @@ pub struct PersonalClient<D: Dispatcher> {
 
 impl<D: Dispatcher> PersonalClient<D> {
 	/// Creates new PersonalClient
-	pub fn new(store: &Option<Arc<AccountProvider>>, dispatcher: D, allow_perm_unlock: bool) -> Self {
+	pub fn new(accounts: Option<Arc<AccountProvider>>, dispatcher: D, allow_perm_unlock: bool) -> Self {
 		PersonalClient {
-			accounts: store.clone(),
-			dispatcher: dispatcher,
-			allow_perm_unlock: allow_perm_unlock,
+			accounts,
+			dispatcher,
+			allow_perm_unlock,
 		}
 	}
 
-	fn account_provider(&self) -> Result<Arc<AccountProvider>, Error> {
+	fn account_provider(&self) -> Result<Arc<AccountProvider>> {
 		unwrap_provider(&self.accounts)
 	}
 }
@@ -56,13 +58,13 @@ impl<D: Dispatcher> PersonalClient<D> {
 impl<D: Dispatcher + 'static> Personal for PersonalClient<D> {
 	type Metadata = Metadata;
 
-	fn accounts(&self) -> Result<Vec<RpcH160>, Error> {
+	fn accounts(&self) -> Result<Vec<RpcH160>> {
 		let store = self.account_provider()?;
 		let accounts = store.accounts().map_err(|e| errors::account("Could not fetch accounts.", e))?;
 		Ok(accounts.into_iter().map(Into::into).collect::<Vec<RpcH160>>())
 	}
 
-	fn new_account(&self, pass: String) -> Result<RpcH160, Error> {
+	fn new_account(&self, pass: String) -> Result<RpcH160> {
 		let store = self.account_provider()?;
 
 		store.new_account(&pass)
@@ -70,7 +72,7 @@ impl<D: Dispatcher + 'static> Personal for PersonalClient<D> {
 			.map_err(|e| errors::account("Could not create account.", e))
 	}
 
-	fn unlock_account(&self, account: RpcH160, account_pass: String, duration: Option<RpcU128>) -> Result<bool, Error> {
+	fn unlock_account(&self, account: RpcH160, account_pass: String, duration: Option<RpcU128>) -> Result<bool> {
 		let account: Address = account.into();
 		let store = self.account_provider()?;
 		let duration = match duration {
@@ -87,19 +89,22 @@ impl<D: Dispatcher + 'static> Personal for PersonalClient<D> {
 		};
 
 		let r = match (self.allow_perm_unlock, duration) {
-			(false, _) => store.unlock_account_temporarily(account, account_pass),
+			(false, None) => store.unlock_account_temporarily(account, account_pass),
+			(false, _) => return Err(errors::unsupported(
+				"Time-unlocking is only supported in --geth compatibility mode.",
+				Some("Restart your client with --geth flag or use personal_sendTransaction instead."),
+			)),
 			(true, Some(0)) => store.unlock_account_permanently(account, account_pass),
 			(true, Some(d)) => store.unlock_account_timed(account, account_pass, d * 1000),
 			(true, None) => store.unlock_account_timed(account, account_pass, 300_000),
 		};
 		match r {
 			Ok(_) => Ok(true),
-			// TODO [ToDr] Proper error here?
-			Err(_) => Ok(false),
+			Err(err) => Err(errors::account("Unable to unlock the account.", err)),
 		}
 	}
 
-	fn send_transaction(&self, meta: Metadata, request: TransactionRequest, password: String) -> BoxFuture<RpcH256, Error> {
+	fn send_transaction(&self, meta: Metadata, request: TransactionRequest, password: String) -> BoxFuture<RpcH256> {
 		let dispatcher = self.dispatcher.clone();
 		let accounts = try_bf!(self.account_provider());
 
@@ -112,10 +117,10 @@ impl<D: Dispatcher + 'static> Personal for PersonalClient<D> {
 
 		let default = match default {
 			Ok(default) => default,
-			Err(e) => return future::err(e).boxed(),
+			Err(e) => return Box::new(future::err(e)),
 		};
 
-		dispatcher.fill_optional_fields(request.into(), default, false)
+		Box::new(dispatcher.fill_optional_fields(request.into(), default, false)
 			.and_then(move |filled| {
 				let condition = filled.condition.clone().map(Into::into);
 				dispatcher.sign(accounts, filled, SignWith::Password(password))
@@ -124,16 +129,15 @@ impl<D: Dispatcher + 'static> Personal for PersonalClient<D> {
 					.map(move |tx| (tx, dispatcher))
 			})
 			.and_then(|(pending_tx, dispatcher)| {
-				let network_id = pending_tx.network_id();
-				trace!(target: "miner", "send_transaction: dispatching tx: {} for network ID {:?}",
-					::rlp::encode(&*pending_tx).into_vec().pretty(), network_id);
+				let chain_id = pending_tx.chain_id();
+				trace!(target: "miner", "send_transaction: dispatching tx: {} for chain ID {:?}",
+					::rlp::encode(&*pending_tx).into_vec().pretty(), chain_id);
 
 				dispatcher.dispatch_transaction(pending_tx).map(Into::into)
-			})
-			.boxed()
+			}))
 	}
 
-	fn sign_and_send_transaction(&self, meta: Metadata, request: TransactionRequest, password: String) -> BoxFuture<RpcH256, Error> {
+	fn sign_and_send_transaction(&self, meta: Metadata, request: TransactionRequest, password: String) -> BoxFuture<RpcH256> {
 		warn!("Using deprecated personal_signAndSendTransaction, use personal_sendTransaction instead.");
 		self.send_transaction(meta, request, password)
 	}

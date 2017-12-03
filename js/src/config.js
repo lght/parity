@@ -14,27 +14,12 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-import LogLevel from 'loglevel';
+import appLogoDark from '../assets/parity-logo-black.png';
+import appLogoDarkNoText from '@parity/shared/assets/images/parity-logo-black-no-text.svg';
+import appLogoLight from '@parity/shared/assets/images/parity-logo-white.svg';
 
-export const LOG_KEYS = {
-  Balances: {
-    key: 'balances',
-    desc: 'Balances fetching'
-  },
-  CertificationsMiddleware: {
-    key: 'certifications.middleware',
-    desc: 'Certifications Middleware'
-  },
-  TransferModalStore: {
-    key: 'modalsTransferStore',
-    desc: 'Transfer modal MobX store'
-  },
-  Signer: {
-    key: 'secureApi',
-    desc: 'The Signer and the Secure API'
-  }
-};
-
-export const getLogger = (LOG_KEY) => {
-  return LogLevel.getLogger(LOG_KEY.key);
+export {
+  appLogoDark,
+  appLogoDarkNoText,
+  appLogoLight
 };

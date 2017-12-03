@@ -20,42 +20,45 @@
 #![cfg_attr(feature="nightly", plugin(clippy))]
 
 extern crate base32;
-extern crate futures;
 extern crate futures_cpupool;
+extern crate itertools;
 extern crate linked_hash_map;
 extern crate mime_guess;
-extern crate ntp;
+extern crate parking_lot;
 extern crate rand;
 extern crate rustc_hex;
 extern crate serde;
 extern crate serde_json;
-extern crate time;
 extern crate unicase;
-extern crate url as url_lib;
 extern crate zip;
 
-extern crate jsonrpc_core;
 extern crate jsonrpc_http_server;
 
 extern crate ethcore_util as util;
+extern crate ethcore_bigint as bigint;
+extern crate ethcore_bytes as bytes;
 extern crate fetch;
+extern crate node_health;
 extern crate parity_dapps_glue as parity_dapps;
 extern crate parity_hash_fetch as hash_fetch;
-extern crate parity_reactor;
 extern crate parity_ui;
+extern crate keccak_hash as hash;
 
 #[macro_use]
-extern crate log;
+extern crate futures;
 #[macro_use]
-extern crate mime;
+extern crate log;
 #[macro_use]
 extern crate serde_derive;
 
 #[cfg(test)]
+extern crate env_logger;
+#[cfg(test)]
 extern crate ethcore_devtools as devtools;
 #[cfg(test)]
-extern crate env_logger;
-
+extern crate jsonrpc_core;
+#[cfg(test)]
+extern crate parity_reactor;
 
 mod endpoint;
 mod apps;
@@ -64,31 +67,24 @@ mod router;
 mod handlers;
 mod api;
 mod proxypac;
-mod url;
 mod web;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::collections::HashMap;
-
+use futures_cpupool::CpuPool;
 use jsonrpc_http_server::{self as http, hyper, Origin};
+use parking_lot::RwLock;
 
 use fetch::Fetch;
-use futures_cpupool::CpuPool;
-use parity_reactor::Remote;
+use node_health::NodeHealth;
 
 pub use hash_fetch::urlhint::ContractClient;
+pub use node_health::SyncStatus;
 
-/// Indicates sync status
-pub trait SyncStatus: Send + Sync {
-	/// Returns true if there is a major sync happening.
-	fn is_major_importing(&self) -> bool;
-
-	/// Returns number of connected and ideal peers.
-	fn peers(&self) -> (usize, usize);
-}
 
 /// Validates Web Proxy tokens
 pub trait WebProxyTokens: Send + Sync {
@@ -101,38 +97,65 @@ impl<F> WebProxyTokens for F where F: Fn(String) -> Option<Origin> + Send + Sync
 }
 
 /// Current supported endpoints.
+#[derive(Default, Clone)]
 pub struct Endpoints {
-	endpoints: endpoint::Endpoints,
+	local_endpoints: Arc<RwLock<Vec<String>>>,
+	endpoints: Arc<RwLock<endpoint::Endpoints>>,
+	dapps_path: PathBuf,
+	embeddable: Option<ParentFrameSettings>,
+	pool: Option<CpuPool>,
 }
 
 impl Endpoints {
 	/// Returns a current list of app endpoints.
 	pub fn list(&self) -> Vec<apps::App> {
-		self.endpoints.iter().filter_map(|(ref k, ref e)| {
+		self.endpoints.read().iter().filter_map(|(ref k, ref e)| {
 			e.info().map(|ref info| apps::App::from_info(k, info))
 		}).collect()
+	}
+
+	/// Check for any changes in the local dapps folder and update.
+	pub fn refresh_local_dapps(&self) {
+		let pool = match self.pool.as_ref() {
+			None => return,
+			Some(pool) => pool,
+		};
+		let new_local = apps::fs::local_endpoints(&self.dapps_path, self.embeddable.clone(), pool.clone());
+		let old_local = mem::replace(&mut *self.local_endpoints.write(), new_local.keys().cloned().collect());
+		let (_, to_remove): (_, Vec<_>) = old_local
+			.into_iter()
+			.partition(|k| new_local.contains_key(&k.clone()));
+
+		let mut endpoints = self.endpoints.write();
+		// remove the dead dapps
+		for k in to_remove {
+			endpoints.remove(&k);
+		}
+		// new dapps to be added
+		for (k, v) in new_local {
+			if !endpoints.contains_key(&k) {
+				endpoints.insert(k, v);
+			}
+		}
 	}
 }
 
 /// Dapps server as `jsonrpc-http-server` request middleware.
 pub struct Middleware {
+	endpoints: Endpoints,
 	router: router::Router,
-	endpoints: endpoint::Endpoints,
 }
 
 impl Middleware {
 	/// Get local endpoints handle.
-	pub fn endpoints(&self) -> Endpoints {
-		Endpoints {
-			endpoints: self.endpoints.clone(),
-		}
+	pub fn endpoints(&self) -> &Endpoints {
+		&self.endpoints
 	}
 
 	/// Creates new middleware for UI server.
 	pub fn ui<F: Fetch>(
-		ntp_server: &str,
 		pool: CpuPool,
-		remote: Remote,
+		health: NodeHealth,
 		dapps_domain: &str,
 		registrar: Arc<ContractClient>,
 		sync_status: Arc<SyncStatus>,
@@ -141,18 +164,16 @@ impl Middleware {
 		let content_fetcher = Arc::new(apps::fetcher::ContentFetcher::new(
 			hash_fetch::urlhint::URLHintContract::new(registrar),
 			sync_status.clone(),
-			remote.clone(),
 			fetch.clone(),
+			pool.clone(),
 		).embeddable_on(None).allow_dapps(false));
 		let special = {
 			let mut special = special_endpoints(
-				ntp_server,
-				pool,
+				pool.clone(),
+				health,
 				content_fetcher.clone(),
-				remote.clone(),
-				sync_status.clone(),
 			);
-			special.insert(router::SpecialEndpoint::Home, Some(apps::ui()));
+			special.insert(router::SpecialEndpoint::Home, Some(apps::ui(pool.clone())));
 			special
 		};
 		let router = router::Router::new(
@@ -164,18 +185,18 @@ impl Middleware {
 		);
 
 		Middleware {
-			router: router,
 			endpoints: Default::default(),
+			router: router,
 		}
 	}
 
 	/// Creates new Dapps server middleware.
 	pub fn dapps<F: Fetch>(
-		ntp_server: &str,
 		pool: CpuPool,
-		remote: Remote,
+		health: NodeHealth,
 		ui_address: Option<(String, u16)>,
 		extra_embed_on: Vec<(String, u16)>,
+		extra_script_src: Vec<(String, u16)>,
 		dapps_path: PathBuf,
 		extra_dapps: Vec<PathBuf>,
 		dapps_domain: &str,
@@ -184,30 +205,35 @@ impl Middleware {
 		web_proxy_tokens: Arc<WebProxyTokens>,
 		fetch: F,
 	) -> Self {
-		let embeddable = as_embeddable(ui_address, extra_embed_on, dapps_domain);
+		let embeddable = as_embeddable(ui_address, extra_embed_on, extra_script_src, dapps_domain);
 		let content_fetcher = Arc::new(apps::fetcher::ContentFetcher::new(
 			hash_fetch::urlhint::URLHintContract::new(registrar),
 			sync_status.clone(),
-			remote.clone(),
 			fetch.clone(),
+			pool.clone(),
 		).embeddable_on(embeddable.clone()).allow_dapps(true));
-		let endpoints = apps::all_endpoints(
-			dapps_path,
+		let (local_endpoints, endpoints) = apps::all_endpoints(
+			dapps_path.clone(),
 			extra_dapps,
 			dapps_domain,
 			embeddable.clone(),
 			web_proxy_tokens,
-			remote.clone(),
 			fetch.clone(),
+			pool.clone(),
 		);
+		let endpoints = Endpoints {
+			endpoints: Arc::new(RwLock::new(endpoints)),
+			dapps_path,
+			local_endpoints: Arc::new(RwLock::new(local_endpoints)),
+			embeddable: embeddable.clone(),
+			pool: Some(pool.clone()),
+		};
 
 		let special = {
 			let mut special = special_endpoints(
-				ntp_server,
-				pool,
+				pool.clone(),
+				health,
 				content_fetcher.clone(),
-				remote.clone(),
-				sync_status,
 			);
 			special.insert(
 				router::SpecialEndpoint::Home,
@@ -225,33 +251,29 @@ impl Middleware {
 		);
 
 		Middleware {
-			router: router,
-			endpoints: endpoints,
+			endpoints,
+			router,
 		}
 	}
 }
 
 impl http::RequestMiddleware for Middleware {
-	fn on_request(&self, req: &hyper::server::Request<hyper::net::HttpStream>, control: &hyper::Control) -> http::RequestMiddlewareAction {
-		self.router.on_request(req, control)
+	fn on_request(&self, req: hyper::Request) -> http::RequestMiddlewareAction {
+		self.router.on_request(req)
 	}
 }
 
 fn special_endpoints(
-	ntp_server: &str,
 	pool: CpuPool,
+	health: NodeHealth,
 	content_fetcher: Arc<apps::fetcher::Fetcher>,
-	remote: Remote,
-	sync_status: Arc<SyncStatus>,
 ) -> HashMap<router::SpecialEndpoint, Option<Box<endpoint::Endpoint>>> {
 	let mut special = HashMap::new();
 	special.insert(router::SpecialEndpoint::Rpc, None);
-	special.insert(router::SpecialEndpoint::Utils, Some(apps::utils()));
+	special.insert(router::SpecialEndpoint::Utils, Some(apps::utils(pool)));
 	special.insert(router::SpecialEndpoint::Api, Some(api::RestApi::new(
 		content_fetcher,
-		sync_status,
-		api::TimeChecker::new(ntp_server.into(), pool),
-		remote,
+		health,
 	)));
 	special
 }
@@ -263,12 +285,14 @@ fn address(host: &str, port: u16) -> String {
 fn as_embeddable(
 	ui_address: Option<(String, u16)>,
 	extra_embed_on: Vec<(String, u16)>,
+	extra_script_src: Vec<(String, u16)>,
 	dapps_domain: &str,
 ) -> Option<ParentFrameSettings> {
 	ui_address.map(|(host, port)| ParentFrameSettings {
 		host,
 		port,
 		extra_embed_on,
+		extra_script_src,
 		dapps_domain: dapps_domain.to_owned(),
 	})
 }
@@ -289,8 +313,10 @@ pub struct ParentFrameSettings {
 	pub host: String,
 	/// Port
 	pub port: u16,
-	/// Additional pages the pages can be embedded on.
+	/// Additional URLs the dapps can be embedded on.
 	pub extra_embed_on: Vec<(String, u16)>,
+	/// Additional URLs the dapp scripts can be loaded from.
+	pub extra_script_src: Vec<(String, u16)>,
 	/// Dapps Domain (web3.site)
 	pub dapps_domain: String,
 }

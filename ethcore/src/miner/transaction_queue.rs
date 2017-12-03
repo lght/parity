@@ -25,11 +25,13 @@
 //!
 //! ```rust
 //! extern crate ethcore_util as util;
+//! extern crate ethcore_bigint as bigint;
 //! extern crate ethcore;
 //! extern crate ethkey;
 //! extern crate rustc_hex;
 //!
-//! use util::{U256, Address};
+//! use bigint::prelude::U256;
+//! use util::Address;
 //! use ethkey::{Random, Generator};
 //!	use ethcore::miner::{TransactionQueue, RemovalReason, TransactionQueueDetailsProvider, AccountDetails, TransactionOrigin};
 //!	use ethcore::transaction::*;
@@ -105,8 +107,11 @@ use std::cmp::Ordering;
 use std::cmp;
 use std::collections::{HashSet, HashMap, BTreeSet, BTreeMap};
 use linked_hash_map::LinkedHashMap;
-use util::{Address, H256, U256, HeapSizeOf};
-use util::table::Table;
+use heapsize::HeapSizeOf;
+use bigint::prelude::U256;
+use bigint::hash::H256;
+use util::Address;
+use table::Table;
 use transaction::*;
 use error::{Error, TransactionError};
 use client::TransactionImportResult;
@@ -336,7 +341,7 @@ impl GasPriceQueue {
 	/// Remove an item from a BTreeMap/HashSet "multimap".
 	/// Returns true if the item was removed successfully.
 	pub fn remove(&mut self, gas_price: &U256, hash: &H256) -> bool {
-		if let Some(mut hashes) = self.backing.get_mut(gas_price) {
+		if let Some(hashes) = self.backing.get_mut(gas_price) {
 			let only_one_left = hashes.len() == 1;
 			if !only_one_left {
 				// Operation may be ok: only if hash is in gas-price's Set.
@@ -506,15 +511,9 @@ pub struct AccountDetails {
 	pub balance: U256,
 }
 
-/// Transactions with `gas > (gas_limit + gas_limit * Factor(in percents))` are not imported to the queue.
-const GAS_LIMIT_HYSTERESIS: usize = 200; // (100/GAS_LIMIT_HYSTERESIS) %
 /// Transaction with the same (sender, nonce) can be replaced only if
 /// `new_gas_price > old_gas_price + old_gas_price >> SHIFT`
 const GAS_PRICE_BUMP_SHIFT: usize = 3; // 2 = 25%, 3 = 12.5%, 4 = 6.25%
-
-/// Future queue limits are lower from current queue limits:
-/// `future_limit = current_limit >> SHIFT`
-const FUTURE_QUEUE_LIMITS_SHIFT: usize = 3; // 2 = 25%, 3 = 12.5%, 4 = 6.25%
 
 /// Describes the strategy used to prioritize transactions in the queue.
 #[cfg_attr(feature="dev", allow(enum_variant_names))]
@@ -570,8 +569,8 @@ pub struct TransactionQueue {
 	minimal_gas_price: U256,
 	/// The maximum amount of gas any individual transaction may use.
 	tx_gas_limit: U256,
-	/// Current gas limit (block gas limit * factor). Transactions above the limit will not be accepted (default to !0)
-	total_gas_limit: U256,
+	/// Current gas limit (block gas limit). Transactions above the limit will not be accepted (default to !0)
+	block_gas_limit: U256,
 	/// Maximal time transaction may occupy the queue.
 	/// When we reach `max_time_in_queue / 2^3` we re-validate
 	/// account balance.
@@ -623,15 +622,15 @@ impl TransactionQueue {
 			by_priority: BTreeSet::new(),
 			by_address: Table::new(),
 			by_gas_price: Default::default(),
-			total_gas_limit: total_gas_limit >> FUTURE_QUEUE_LIMITS_SHIFT,
-			limit: limit >> FUTURE_QUEUE_LIMITS_SHIFT,
-			memory_limit: memory_limit >> FUTURE_QUEUE_LIMITS_SHIFT,
+			total_gas_limit,
+			limit,
+			memory_limit,
 		};
 
 		TransactionQueue {
 			strategy,
 			minimal_gas_price: U256::zero(),
-			total_gas_limit: !U256::zero(),
+			block_gas_limit: !U256::zero(),
 			tx_gas_limit,
 			max_time_in_queue: DEFAULT_QUEUING_PERIOD,
 			current,
@@ -646,7 +645,7 @@ impl TransactionQueue {
 	/// Set the new limit for `current` and `future` queue.
 	pub fn set_limit(&mut self, limit: usize) {
 		self.current.set_limit(limit);
-		self.future.set_limit(limit >> FUTURE_QUEUE_LIMITS_SHIFT);
+		self.future.set_limit(limit);
 		// And ensure the limits
 		self.current.enforce_limit(&mut self.by_hash, &mut self.local_transactions);
 		self.future.enforce_limit(&mut self.by_hash, &mut self.local_transactions);
@@ -674,22 +673,16 @@ impl TransactionQueue {
 		self.current.gas_price_entry_limit()
 	}
 
-	/// Sets new gas limit. Transactions with gas slightly (`GAS_LIMIT_HYSTERESIS`) above the limit won't be imported.
+	/// Sets new gas limit. Transactions with gas over the limit will not be accepted.
 	/// Any transaction already imported to the queue is not affected.
 	pub fn set_gas_limit(&mut self, gas_limit: U256) {
-		let extra = gas_limit / U256::from(GAS_LIMIT_HYSTERESIS);
-
-		let total_gas_limit = match gas_limit.overflowing_add(extra) {
-			(_, true) => !U256::zero(),
-			(val, false) => val,
-		};
-		self.total_gas_limit = total_gas_limit;
+		self.block_gas_limit = gas_limit;
 	}
 
 	/// Sets new total gas limit.
 	pub fn set_total_gas_limit(&mut self, total_gas_limit: U256) {
 		self.current.total_gas_limit = total_gas_limit;
-		self.future.total_gas_limit = total_gas_limit >> FUTURE_QUEUE_LIMITS_SHIFT;
+		self.future.total_gas_limit = total_gas_limit;
 		self.future.enforce_limit(&mut self.by_hash, &mut self.local_transactions);
 	}
 
@@ -819,13 +812,13 @@ impl TransactionQueue {
 			}));
 		}
 
-		let gas_limit = cmp::min(self.tx_gas_limit, self.total_gas_limit);
+		let gas_limit = cmp::min(self.tx_gas_limit, self.block_gas_limit);
 		if tx.gas > gas_limit {
 			trace!(target: "txqueue",
 				"Dropping transaction above gas limit: {:?} ({} > min({}, {}))",
 				tx.hash(),
 				tx.gas,
-				self.total_gas_limit,
+				self.block_gas_limit,
 				self.tx_gas_limit
 			);
 			return Err(Error::Transaction(TransactionError::GasLimitExceeded {
@@ -1228,7 +1221,7 @@ impl TransactionQueue {
 			if by_nonce.is_none() {
 				return;
 			}
-			let mut by_nonce = by_nonce.expect("None is tested in early-exit condition above; qed");
+			let by_nonce = by_nonce.expect("None is tested in early-exit condition above; qed");
 			while let Some(order) = by_nonce.remove(&current_nonce) {
 				// remove also from priority and gas_price
 				self.future.by_priority.remove(&order);
@@ -1447,7 +1440,7 @@ fn check_if_removed(sender: &Address, nonce: &U256, dropped: Option<HashMap<Addr
 #[cfg(test)]
 pub mod test {
 	use rustc_hex::FromHex;
-	use util::table::*;
+	use table::Table;
 	use util::*;
 	use ethkey::{Random, Generator};
 	use error::{Error, TransactionError};
@@ -1922,13 +1915,13 @@ pub mod test {
 		// given
 		let mut txq = TransactionQueue::default();
 		txq.set_gas_limit(U256::zero());
-		assert_eq!(txq.total_gas_limit, U256::zero());
+		assert_eq!(txq.block_gas_limit, U256::zero());
 
 		// when
 		txq.set_gas_limit(!U256::zero());
 
 		// then
-		assert_eq!(txq.total_gas_limit, !U256::zero());
+		assert_eq!(txq.block_gas_limit, !U256::zero());
 	}
 
 	#[test]
@@ -1945,7 +1938,7 @@ pub mod test {
 
 		// then
 		assert_eq!(unwrap_tx_err(res), TransactionError::GasLimitExceeded {
-			limit: U256::from(50_250), // Should be 100.5% of set_gas_limit
+			limit: U256::from(50_000),
 			got: gas,
 		});
 		let stats = txq.status();
@@ -2415,7 +2408,7 @@ pub mod test {
 	fn should_limit_future_transactions() {
 		let mut txq = TransactionQueue::with_limits(
 			PrioritizationStrategy::GasPriceOnly,
-			1 << FUTURE_QUEUE_LIMITS_SHIFT,
+			1,
 			usize::max_value(),
 			!U256::zero(),
 			!U256::zero(),
@@ -2739,7 +2732,7 @@ pub mod test {
 		// given
 		let mut txq = TransactionQueue::with_limits(
 			PrioritizationStrategy::GasPriceOnly,
-			1 << FUTURE_QUEUE_LIMITS_SHIFT,
+			1,
 			usize::max_value(),
 			!U256::zero(),
 			!U256::zero()
