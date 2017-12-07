@@ -1,6 +1,6 @@
 {
   "name": "Parity",
-  "version": "1.9.21",
+  "version": "1.9.28",
   "main": "src/index.parity.js",
   "jsnext:main": "src/index.parity.js",
   "author": "Parity Team <admin@parity.io>",
@@ -40,8 +40,8 @@
     "start": "npm run clean && npm install && npm run build:inject && npm run start:app",
     "start:app": "node webpack/dev.server",
     "start:electron": "npm run build:app && electron .build/",
-    "test": "cross-env NODE_ENV=test mocha --compilers ejs:ejsify 'src/**/*.spec.js'",
-    "test:coverage": "cross-env NODE_ENV=test istanbul cover _mocha -- --compilers ejs:ejsify 'src/**/*.spec.js'"
+    "test": "cross-env NODE_ENV=test mocha 'src/**/*.spec.js'",
+    "test:coverage": "cross-env NODE_ENV=test istanbul cover _mocha -- 'src/**/*.spec.js'"
   },
   "devDependencies": {
     "@parity/dapp-console": "paritytech/dapp-console",
@@ -84,7 +84,6 @@
     "cross-env": "5.1.1",
     "css-loader": "0.28.4",
     "ejs-loader": "0.3.0",
-    "ejsify": "1.0.0",
     "electron": "1.7.5",
     "empty-module": "0.0.2",
     "enzyme": "3.2.0",
@@ -105,7 +104,6 @@
     "html-loader": "0.4.4",
     "html-webpack-plugin": "2.30.1",
     "http-proxy-middleware": "0.17.3",
-    "ignore-styles": "5.0.1",
     "istanbul": "1.0.0-alpha.2",
     "jsdom": "9.11.0",
     "json-loader": "0.5.4",
@@ -144,14 +142,13 @@
     "yargs": "6.6.0"
   },
   "dependencies": {
-    "@parity/api": "2.1.x",
-    "@parity/dapp-accounts": "paritytech/dapp-accounts",
+    "@parity/api": "^2.1.1",
     "@parity/plugin-signer-account": "paritytech/plugin-signer-account",
     "@parity/plugin-signer-default": "paritytech/plugin-signer-default",
     "@parity/plugin-signer-hardware": "paritytech/plugin-signer-hardware",
     "@parity/plugin-signer-qr": "paritytech/plugin-signer-qr",
-    "@parity/shared": "2.2.x",
-    "@parity/ui": "3.0.x",
+    "@parity/shared": "^2.2.9",
+    "@parity/ui": "^3.0.14",
     "keythereum": "1.0.2",
     "lodash.flatten": "4.4.0",
     "lodash.omitby": "4.6.0",
@@ -172,6 +169,7 @@
     "react-tap-event-plugin": "3.0.2",
     "react-transition-group": "2.2.1",
     "redux": "3.7.2",
+    "semantic-ui-react": "0.77.0",
     "solc": "ngotchac/solc-js",
     "store": "1.3.20",
     "web3": "0.17.0-beta"
