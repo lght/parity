@@ -19,6 +19,14 @@
 //! Unconfirmed sub-states are managed with `checkpoint`s which may be canonicalized
 //! or rolled back.
 
+extern crate keccak_hash as hash;
+extern crate patricia_trie as trie;
+extern crate ethcore_bigint as bigint;
+extern crate ethcore_bytes as bytes;
+extern crate ethcore_util as util;
+extern crate evm;
+extern crate vm;
+
 use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, BTreeMap, HashSet};
@@ -40,6 +48,7 @@ use executed::{Executed, ExecutionError};
 use types::state_diff::StateDiff;
 use transaction::SignedTransaction;
 use state_db::StateDB;
+
 use evm::{Factory as EvmFactory};
 
 use bigint::prelude::U256;
@@ -47,10 +56,8 @@ use bigint::hash::H256;
 use util::*;
 use bytes::Bytes;
 
-use trie;
 use trie::{Trie, TrieError, TrieDB};
 use trie::recorder::Recorder;
-
 
 mod account;
 mod substate;

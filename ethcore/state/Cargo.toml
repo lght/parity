@@ -1,0 +1,15 @@
+[package]
+name = "ethcore-state"
+version = "0.1.0"
+authors = ["Parity Technologies <admin@parity.io>"]
+
+[dependencies]
+keccak-hash = { path = "../../util/hash" }
+patricia-trie = { path = "../../util/patricia_trie" }
+
+ethcore-bigint = { path = "../../util/bigint" }
+ethcore-bytes = { path = "../../util/bytes" }
+ethcore-util = { path = "../../util" }
+
+evm = { path = "../evm" }
+vm = { path = "../vm" }

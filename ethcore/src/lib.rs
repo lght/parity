@@ -146,6 +146,7 @@ extern crate evm;
 extern crate evmjit;
 
 pub extern crate ethstore;
+pub extern crate ethcore_state as state;
 
 pub mod account_provider;
 pub mod block;
@@ -164,7 +165,6 @@ pub mod pod_state;
 pub mod service;
 pub mod snapshot;
 pub mod spec;
-pub mod state;
 pub mod timer;
 pub mod trace;
 pub mod transaction;

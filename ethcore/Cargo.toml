@@ -23,6 +23,7 @@ patricia-trie = { path = "../util/patricia_trie" }
 ethcore-devtools = { path = "../devtools" }
 ethcore-io = { path = "../util/io" }
 ethcore-logger = { path = "../logger" }
+ethcore-state = { path = "state" }
 ethcore-stratum = { path = "../stratum" }
 ethcore-util = { path = "../util" }
 ethcore-bigint = { path = "../util/bigint" }
