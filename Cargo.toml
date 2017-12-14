@@ -41,6 +41,7 @@ ethcore-io = { path = "util/io" }
 ethcore-devtools = { path = "devtools" }
 ethcore-light = { path = "ethcore/light" }
 ethcore-logger = { path = "logger" }
+ethcore-mini = { path = "ethcore/mini", optional = true }
 ethcore-stratum = { path = "stratum" }
 ethcore-network = { path = "util/network" }
 node-filter = { path = "ethcore/node_filter" }
