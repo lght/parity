@@ -38,6 +38,7 @@ lazy_static = "0.2"
 linked-hash-map = "0.5"
 log = "0.3"
 lru-cache = "0.1"
+native-contracts = { path = "../native_contracts" }
 num = "0.1"
 num_cpus = "1.2"
 parity-machine = { path = "../../machine" }
@@ -68,6 +69,9 @@ triehash = { path = "../../util/triehash" }
 semantic_version = { path = "../../util/semantic_version" }
 unexpected = { path = "../../util/unexpected" }
 journaldb = { path = "../../util/journaldb" }
+
+[dev-dependencies]
+native-contracts = { path = "../native_contracts", features = ["test_contracts"] }
 
 [features]
 evm-debug = ["slow-blocks"]

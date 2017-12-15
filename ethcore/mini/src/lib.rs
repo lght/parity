@@ -138,9 +138,7 @@ extern crate log;
 extern crate lazy_static;
 #[cfg_attr(test, macro_use)]
 extern crate evm;
-
-#[cfg(feature = "jit" )]
-extern crate evmjit;
+extern crate native_contracts;
 
 pub extern crate ethstore;
 
